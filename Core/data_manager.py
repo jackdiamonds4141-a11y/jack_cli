@@ -33,7 +33,10 @@ class DaemonShutdownRequest(Exception):
 
 # ──────────── CONSTANTS (Frozen at Boot) ────────────
 SOCKET_PATH = "/tmp/swarm-mediator.sock"
-WORKSPACE_ROOT = Path("/home/jack/Documents/Agent-Swarm")
+# Resolve workspace root dynamically:
+#   1. JACK_WORKSPACE env var (explicit override)
+#   2. Parent of Core/ directory (the repository root)
+WORKSPACE_ROOT = Path(os.environ.get("JACK_WORKSPACE", Path(__file__).parent.parent)).resolve()
 ANCHOR_PATH = WORKSPACE_ROOT / "References" / "Layering" / "Layering_Prompts" / "anchor.yaml"
 
 # ──────────── LOGGING ────────────
@@ -276,8 +279,8 @@ class DataManagerDaemon:
     def _load_anchor(self) -> dict:
         """Load and parse anchor.yaml — the immutable project law."""
         if not ANCHOR_PATH.exists():
-            logger.critical(f"anchor.yaml not found at {ANCHOR_PATH}. Cannot boot.")
-            sys.exit(1)
+            logger.warning(f"anchor.yaml not found at {ANCHOR_PATH}. Running without anchor constraints.")
+            return {}
         try:
             with open(ANCHOR_PATH, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f)
@@ -286,8 +289,8 @@ class DataManagerDaemon:
             logger.info("anchor.yaml loaded successfully.")
             return config
         except Exception as e:
-            logger.critical(f"Failed to parse anchor.yaml: {e}")
-            sys.exit(1)
+            logger.error(f"Failed to parse anchor.yaml: {e}. Running without anchor constraints.")
+            return {}
 
     def _parse_frozen_files(self) -> list[str]:
         """Extract the list of immutable file patterns from anchor config."""

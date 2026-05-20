@@ -376,10 +376,18 @@ def send_daemon_message(payload: dict) -> dict:
         sock.settimeout(2.0)
         sock.connect(SOCKET_PATH)
         sock.sendall(json.dumps(payload).encode("utf-8"))
-        raw_resp = sock.recv(1024 * 1024)
+        sock.shutdown(socket.SHUT_WR)
+
+        response_data = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            response_data += chunk
         sock.close()
-        if raw_resp:
-            return json.loads(raw_resp.decode("utf-8"))
+
+        if response_data:
+            return json.loads(response_data.decode("utf-8"))
     except Exception:
         pass
     return {"status": "NACK", "reason": "Could not communicate with daemon"}
@@ -621,18 +629,71 @@ def boot_daemon() -> Optional[int]:
     process.terminate()
     sys.exit(1)
 
+def _run_setup_wizard():
+    """Interactive first-time setup: prompts for the Gemini API key and saves it to .env."""
+    env_file = Path(__file__).parent / ".env"
+    os.system("clear" if os.name != "nt" else "cls")
+
+    print("=" * 60)
+    print("  Jack Engine — First-Time Setup Wizard")
+    print("=" * 60)
+    print()
+    print("  This tool uses the Gemini AI Studio API to power its")
+    print("  agent swarm. You can get a free API key from:")
+    print("  https://aistudio.google.com/apikey")
+    print()
+    print("  Any strictly compatible endpoint key will also work.")
+    print("  (Custom calling schemas are not supported yet.)")
+    print()
+
+    if env_file.exists():
+        existing_key = load_env_key()
+        if existing_key:
+            masked = existing_key[:8] + "..." + existing_key[-4:]
+            print(f"  [!] Existing key detected: {masked}")
+            print()
+            confirm = input("  Overwrite existing key? (y/N): ").strip().lower()
+            if confirm != "y":
+                print("\n  [+] Setup cancelled. Existing key preserved.")
+                return
+
+    print("-" * 60)
+    api_key = input("  Please paste your Gemini AI Studio API Key: ").strip()
+
+    if not api_key:
+        print("\n  [-] No key provided. Setup aborted.")
+        return
+
+    try:
+        with open(env_file, "w", encoding="utf-8") as f:
+            f.write("# Jack Engine — Local Environment Configuration\n")
+            f.write("# WARNING: Do NOT commit this file. It is gitignored.\n\n")
+            f.write(f"GEMINI_API_KEY={api_key}\n")
+        print(f"\n  [+] API key saved to {env_file}")
+        print("  [+] You are ready to go! Run your first swarm with:")
+        print()
+        print('    python3 jack_cli.py --layer "1.1" --workers 1 --prompt "Your task here"')
+        print()
+    except Exception as e:
+        print(f"\n  [-] Failed to write .env file: {e}")
+
 def main():
     parser = argparse.ArgumentParser(description="Jack Engine v4.1 — CLI Bundler (Rolling Horizon)")
     parser.add_argument("--layer", required=False, help="Layer index (e.g., 1.1, 1.1.2). Used to namespace all state files.")
     parser.add_argument("--prompt", required=False, help="Seed prompt for the swarm")
     parser.add_argument("--workers", type=int, default=20, help="Number of concurrent workers")
     parser.add_argument("--dump-constitution", action="store_true", help="Print the bundled protocols to stdout")
+    parser.add_argument("--setup", action="store_true", help="Interactive first-time setup: prompts for your Gemini API key and saves it to a local .env file")
 
     parser.add_argument("--mode", choices=["swarm", "native"], default="swarm", help="Execution mode (swarm or native)")
     parser.add_argument("--dump-file", default=None, help="Override path for consensus dump (auto-generated from --layer if omitted)")
     parser.add_argument("--cleanup", action="store_true", help="Trigger nuclear teardown: kill processes, purge ALL layer state files")
 
     args = parser.parse_args()
+
+    if args.setup:
+        _run_setup_wizard()
+        sys.exit(0)
 
     if args.cleanup:
         run_cleanup()
@@ -643,7 +704,7 @@ def main():
         sys.exit(0)
 
     if not args.layer or not args.prompt:
-        parser.error("--layer and --prompt are required unless running with --dump-constitution or --cleanup")
+        parser.error("--layer and --prompt are required unless running with --setup, --dump-constitution, or --cleanup")
 
     pool_file = layer_pool_path(args.layer)
     ledger_file = layer_ledger_path(args.layer)
