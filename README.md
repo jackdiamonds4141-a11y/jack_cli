@@ -1,56 +1,100 @@
-# Jack Engine CLI
+# Jack Engine
 
-A lightweight CLI that orchestrates local AI agent swarms under strict runtime constraint gates — adversarial multi-agent debate, claim-level verification, and POSIX-atomic state persistence — to produce research and engineering outputs that consistently out-reason multi-billion dollar flagship models. For free.
+### Turn cheap AI models into an elite reasoning squad.
 
-Instead of trusting a single LLM completion, Jack spawns a configurable swarm of workers that independently generate proposals, challenge each other's claims, and synthesize consensus through a formalized adversarial protocol. A central mediator daemon serializes all state through Unix Domain Sockets, enforces immutable anchor constraints, and persists everything via atomic writes. The result: hallucination-resistant, citation-grade output from cheap models.
+I got tired of watching $200/month flagship models hallucinate on hard problems. So I built a CLI that takes the cheapest Gemini model available, spawns a swarm of independent workers, makes them argue with each other through a formalized adversarial protocol, and produces outputs that consistently outperform single-shot completions from models 100x the cost.
+
+No fine-tuning. No RAG pipeline. No vector database. Just structured multi-agent debate with strict runtime constraint gates, claim-level deduplication, and POSIX-atomic state persistence over Unix sockets.
+
+The entire thing runs locally on your machine for free.
+
+---
+
+> ⚠️ **Note:** As of now, this framework has only been tested with the **Antigravity IDE**. Universal compatibility with other agentic IDEs is unknown. If you get it working in Cursor, Windsurf, or anything else — let me know.
 
 ---
 
 ## Getting Started
 
-### 1. Clone
+You need **Python 3.10+** and a free Gemini API key.
+
+### 1. Clone it
 
 ```bash
 git clone https://github.com/jackdiamonds4141-a11y/jack_cli.git
 cd jack_cli
 ```
 
-### 2. Install Dependencies
-
-Requires **Python 3.10+**.
+### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Set Up Your API Key
-
-Jack Engine is built for the **Gemini AI Studio API**. Any strictly compatible endpoint will work — we just don't support custom calling schemas yet.
-
-Get a free key from [Google AI Studio](https://aistudio.google.com/apikey), then run:
+### 3. Set up your API key
 
 ```bash
 python3 jack_cli.py --setup
 ```
 
-The setup wizard will prompt you to paste your key and save it to a local `.env` file that is automatically gitignored. That's it — you're ready to go.
+That's it. The setup wizard will ask you to paste your key (grab one for free from [Google AI Studio](https://aistudio.google.com/apikey)) and save it locally. The key never touches Git.
 
-> **Alternative**: If you prefer environment variables (useful for CI/containers), export directly:
-> ```bash
-> export GEMINI_API_KEY="your-key-here"
-> ```
-> The engine checks `os.environ` first, then falls back to `.env`.
+This tool is built for the **Gemini AI Studio API**. Any strictly compatible endpoint will work — we just don't support custom calling schemas yet.
 
-### 4. Run Your First Swarm
+---
+
+## How to Use
+
+Jack Engine is designed to be operated by your IDE agent, not by hand. You give your agent a kickoff prompt, it reads the built-in manual, and then it knows how to call the CLI autonomously whenever it hits a hard problem.
+
+### The Copy-Paste Kickoff Prompt
+
+Drop this into your IDE agent chat to get started:
+
+> *"I have a CLI tool at `jack_cli.py` that is set up for brainstorming and complex reasoning. First, run its help command (`python3 jack_cli.py --help`) to read the internal operator manual. Once you fully understand how the tool works — what it does, how layering works, how often to call the swarm, and the critical directives — we will use it to solve our problem. Do not attempt to read or modify the tool's source code. Just execute it as documented."*
+
+The agent will run `--help`, read the full manual baked into the epilog, and from that point on it knows exactly how to invoke the swarm with proper layering, when to call `--cleanup`, and how to consume the consensus dumps.
+
+### Manual Usage (if you want to run it yourself)
 
 ```bash
+# Clean state from any prior run
+python3 jack_cli.py --cleanup
+
+# Fire a single-worker research sweep
 python3 jack_cli.py --layer "1.1" --workers 1 \
   --prompt "Derive the critical measurement probability for MIPT in a 2D toric code."
+
+# Fire a full 20-worker adversarial swarm
+python3 jack_cli.py --layer "1.1" --workers 20 \
+  --prompt "Design a zero-knowledge proof system for federated learning."
 ```
 
 ---
 
-## How It Works
+## CLI Quick Reference
+
+| Flag | What it does |
+|:---|:---|
+| `--setup` | First-time setup. Asks for your Gemini key and saves it locally. |
+| `--cleanup` | **Run this first.** Kills stale daemons, wipes sockets, purges all cached state files. |
+| `--layer "X.Y"` | Namespaces your task. Use a new layer for each problem. Sequential layers auto-inherit context. |
+| `--prompt "..."` | The problem statement fed to every worker in the swarm. |
+| `--workers N` | How many workers to spawn (default 20, concurrency capped at 5). |
+| `--mode native` | Single-pass mode, no daemon. For simple tasks that don't need multi-agent debate. |
+| `--dump-constitution` | Prints the embedded research + agentic protocols to stdout. |
+
+### Environment Variables
+
+| Variable | Default | What it does |
+|:---|:---|:---|
+| `GEMINI_API_KEY` | — | Your API key. Set via `--setup` or `export` directly. |
+| `JACK_SWARM_MODEL` | `gemini-2.5-flash-lite` | Override the model all workers use. |
+| `JACK_WORKSPACE` | Repo root | Override the workspace root for the mediator daemon. |
+
+---
+
+## What's Under the Hood
 
 ```
 ┌─────────────┐     UDS Socket      ┌──────────────────┐
@@ -66,118 +110,11 @@ python3 jack_cli.py --layer "1.1" --workers 1 \
                                     └──────────────────┘
 ```
 
-1. **`jack_cli.py`** boots the mediator daemon, seeds the idea pool, and spawns N async workers.
-2. Each **worker** calls the Gemini API independently, generating structured JSON proposals with explicit claims.
-3. Workers submit results to the **mediator daemon** over a Unix Domain Socket.
-4. The daemon validates payloads, runs claim deduplication and glow scoring, enforces anchor constraints, and persists state via POSIX atomic writes (`tmp → fsync → rename`).
-5. After all workers complete, the CLI compiles residues (failed/orphaned tasks), writes a consensus dump, and suspends the daemon.
-
----
-
-## CLI Reference
-
-### Core Options
-
-| Flag | Required | Default | Description |
-|:---|:---|:---|:---|
-| `--layer` | Yes* | — | Layer index (e.g. `1.1`, `2.3.1`). Namespaces all state files so parallel task trees never collide. |
-| `--prompt` | Yes* | — | The seed prompt fed to every worker in the swarm. |
-| `--workers` | No | `20` | Number of async workers to spawn. Actual API concurrency is capped at 5 via internal semaphore. |
-| `--mode` | No | `swarm` | `swarm` (full multi-agent) or `native` (single-pass, no daemon). |
-| `--dump-file` | No | Auto | Override path for the consensus dump JSON. Auto-generated from `--layer` if omitted. |
-
-*\*Required unless using `--setup`, `--cleanup`, or `--dump-constitution`.*
-
-### Utility Flags
-
-| Flag | Description |
-|:---|:---|
-| `--setup` | **First-time setup wizard.** Prompts for your Gemini API key and saves it to a gitignored `.env` file. |
-| `--cleanup` | **Nuclear teardown failsafe.** Kills all daemon and CLI processes, removes the UDS socket file, and purges ALL layer state files (`idea_pool`, `residue_ledger`, `consensus_dump`) plus legacy artifacts. **Run this before any fresh execution** to guarantee zero state contamination from prior runs. |
-| `--dump-constitution` | Prints the full embedded protocol constitution to stdout. Useful for inspecting what system instructions the workers receive. |
-
-### Examples
-
-```bash
-# First-time setup
-python3 jack_cli.py --setup
-
-# Run a single-worker research sweep
-python3 jack_cli.py --layer "1.1" --workers 1 \
-  --prompt "Analyze the phase diagram of a 2D topological surface code under MIPT."
-
-# Run a full 20-worker adversarial swarm
-python3 jack_cli.py --layer "1.1" --workers 20 \
-  --prompt "Design a zero-knowledge proof system for federated learning."
-
-# Clean up ALL state before a fresh run
-python3 jack_cli.py --cleanup
-
-# Native mode — single-pass, no daemon overhead
-python3 jack_cli.py --layer "2.1" --mode native \
-  --prompt "Scaffold a basic REST API for the consensus ledger."
-```
-
-### Environment Variables
-
-| Variable | Default | Description |
-|:---|:---|:---|
-| `GEMINI_API_KEY` | — | Your Gemini AI Studio API key. Can also be set via `--setup`. |
-| `JACK_SWARM_MODEL` | `gemini-2.5-flash-lite` | Override the default model for all workers. |
-| `JACK_WORKSPACE` | Repo root | Override the workspace root directory for the mediator daemon. |
-
----
-
-## Socket Payload Schema
-
-Workers communicate with the mediator daemon over a Unix Domain Socket at `/tmp/swarm-mediator.sock`. If you want to build a custom client in any language, here's the contract:
-
-### Transport Rules
-
-1. Connect to `socket.AF_UNIX` at `/tmp/swarm-mediator.sock`.
-2. Send your JSON payload as UTF-8 bytes via `sendall()`.
-3. **Call `socket.SHUT_WR` immediately after sending.** The daemon reads until EOF — without the half-close, the receive loop blocks indefinitely.
-4. Read the response bytes until the connection closes.
-
-### Payload Keys
-
-```json
-{
-  "action": "meme",
-  "meme_type": "PROPOSAL",
-  "requester": "worker_01",
-  "layer_index": "1.1",
-  "branch_id": "branch_worker_01_seed_01",
-  "content": "Full text of the proposal.",
-  "claims": ["Claim 1 text", "Claim 2 text"],
-  "target_branch_id": null
-}
-```
-
-| Key | Type | Required | Description |
-|:---|:---|:---|:---|
-| `action` | string | Yes | `meme`, `read`, `write`, `status`, `shutdown`, `suspend`, `wakeup`, `load_queue`, `pop_idea`, `record_residue`, or `fact_inject`. |
-| `meme_type` | string | For `meme` | `PROPOSAL`, `CHALLENGE`, or `SYNTHESIS`. |
-| `requester` | string | Yes | Worker identifier for audit trail. |
-| `layer_index` | string | For `meme` | Which layer this submission belongs to. |
-| `content` | string | For `meme`/`write` | The generated content payload. |
-| `claims` | list[str] | For `meme` | Discrete atomic claims extracted from the content. |
-| `target_branch_id` | string | No | Only for challenges — targets a specific branch. |
-
-### Response Format
-
-```json
-{
-  "status": "ACK",
-  "timestamp": "2026-05-21T00:00:00+00:00",
-  "reason": "Tweet ingested into GENESIS phase",
-  "signals": ["REQUEST_GROUND:abc123"],
-  "current_phase": "GENESIS",
-  "round_number": 1
-}
-```
-
-Status is `ACK`, `NACK`, or `EMPTY`. Malformed payloads get a descriptive `NACK` explaining exactly what's wrong.
+- **Conductor** (`jack_cli.py`) boots the mediator daemon, seeds the task pool, spawns N async workers, and collects results.
+- **Workers** independently call the Gemini API, generating structured proposals with explicit atomic claims.
+- **Mediator Daemon** (`data_manager.py`) serializes everything through a single Unix Domain Socket. Validates payloads, deduplicates claims, computes glow scores, enforces anchor constraints, and persists state via POSIX atomic writes (`tmp → fsync → rename`).
+- **Social State Machine** runs adversarial lifecycle phases: `GENESIS → OPEN_CHALLENGE → SYNTHESIS_PENDING → IDE_REVIEW → PROMOTED`.
+- **Embedded Constitution** — research protocols, source verification frameworks, and agentic coordination rules are baked directly into the worker system instructions. No external config files needed.
 
 ---
 
@@ -185,21 +122,17 @@ Status is `ACK`, `NACK`, or `EMPTY`. Malformed payloads get a descriptive `NACK`
 
 ```
 jack_cli/
-├── jack_cli.py                  # CLI conductor — boots daemon, spawns workers
+├── jack_cli.py                  # CLI conductor — the only file you execute
 ├── requirements.txt             # Python dependencies
 ├── Core/
-│   ├── data_manager.py          # UDS mediator daemon (all I/O flows here)
-│   ├── social_state_machine.py  # Adversarial lifecycle + claim registry
+│   ├── data_manager.py          # UDS mediator daemon
+│   ├── social_state_machine.py  # Adversarial lifecycle + claim registry + glow engine
 │   ├── epoch_coordinator.py     # Epoch barrier synchronization
 │   ├── halting.py               # Worker halting controller
-│   ├── differentiation.py       # Epoch strategy director + loop clock
-│   ├── attention_variants.py    # Decoupled position tagger
-│   └── act_accumulator.py       # Claim accumulation utilities
-├── tests/
-│   ├── test_chunk2_differentiation.py
-│   ├── test_chunk3_orchestration.py
-│   ├── test_chunk4_attention_goblin.py
-│   └── test_lti_stabilization.py
+│   ├── differentiation.py       # Epoch strategy director
+│   ├── attention_variants.py    # Position tagger for prompt assembly
+│   └── act_accumulator.py       # Claim accumulation
+├── tests/                       # Unit tests
 ├── .env                         # Your API key (gitignored, created by --setup)
 └── .gitignore
 ```

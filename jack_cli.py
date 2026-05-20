@@ -678,16 +678,107 @@ def _run_setup_wizard():
         print(f"\n  [-] Failed to write .env file: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Jack Engine v4.1 — CLI Bundler (Rolling Horizon)")
-    parser.add_argument("--layer", required=False, help="Layer index (e.g., 1.1, 1.1.2). Used to namespace all state files.")
-    parser.add_argument("--prompt", required=False, help="Seed prompt for the swarm")
-    parser.add_argument("--workers", type=int, default=20, help="Number of concurrent workers")
-    parser.add_argument("--dump-constitution", action="store_true", help="Print the bundled protocols to stdout")
-    parser.add_argument("--setup", action="store_true", help="Interactive first-time setup: prompts for your Gemini API key and saves it to a local .env file")
+    epilog_text = """
+================================================================================
+  JACK ENGINE — AGENT OPERATOR MANUAL (READ THIS COMPLETELY BEFORE EXECUTING)
+================================================================================
 
-    parser.add_argument("--mode", choices=["swarm", "native"], default="swarm", help="Execution mode (swarm or native)")
-    parser.add_argument("--dump-file", default=None, help="Override path for consensus dump (auto-generated from --layer if omitted)")
-    parser.add_argument("--cleanup", action="store_true", help="Trigger nuclear teardown: kill processes, purge ALL layer state files")
+  WHAT THIS TOOL IS:
+  ------------------
+  Jack Engine is a dedicated BRAINSTORMING and COMPLEX REASONING engine.
+  It spawns a swarm of independent AI workers that debate, challenge, and
+  synthesize consensus on hard problems — physics, architecture, security,
+  novel algorithms — through a formalized adversarial protocol.
+
+  This is NOT a general-purpose code generation tool. Use it when you need
+  rigorous, multi-perspective analysis on problems where a single model
+  completion would risk hallucination or tunnel vision.
+
+  CRITICAL DIRECTIVE:
+  -------------------
+  DO NOT attempt to read, debug, or modify the underlying Python source
+  code of this CLI. It is a self-contained, production-tested runtime.
+  Just execute the tool exactly as documented below. If something fails,
+  run --cleanup and retry. Do not open jack_cli.py or Core/ to investigate.
+
+  HOW LAYERING WORKS:
+  -------------------
+  The --layer flag namespaces all state files (idea pools, residue ledgers,
+  consensus dumps) so that multiple independent tasks can coexist without
+  collision. Think of layers as isolated workspaces:
+
+    Layer "1.1"  → tmp/idea_pool_layer_1.1.json, etc.
+    Layer "1.2"  → tmp/idea_pool_layer_1.2.json, etc.
+
+  Use a NEW layer index for each distinct problem or sub-task. Do NOT reuse
+  a layer index unless you intentionally want to resume from its prior state.
+
+  For sequential multi-step projects, use dotted notation:
+    Step 1 → --layer "1.1"
+    Step 2 → --layer "1.2"  (auto-inherits context from 1.1 via re-hydration)
+    Step 3 → --layer "1.3"
+
+  HOW OFTEN TO CALL THE SWARM:
+  ----------------------------
+  Call the swarm ONCE per problem or sub-problem. Do not spam multiple
+  invocations for the same task. The swarm internally handles parallel
+  debate — you just fire once and collect the consensus dump.
+
+  Typical workflow:
+    1. Run --cleanup to clear any stale state from prior sessions.
+    2. Run the swarm with --layer, --prompt, and --workers.
+    3. Read the consensus dump from tmp/consensus_dump_layer_<N>.json
+    4. Use the results in your next step.
+
+  SOCKET PAYLOAD SCHEMA (for custom client integration):
+  ------------------------------------------------------
+  Transport: Unix Domain Socket at /tmp/swarm-mediator.sock
+  Protocol:  Send JSON via sendall(), then call socket.SHUT_WR to signal
+             EOF. The daemon reads until EOF — without SHUT_WR, it hangs.
+
+  Required payload keys for 'meme' action:
+    {
+      "action":           "meme",
+      "meme_type":        "PROPOSAL" | "CHALLENGE" | "SYNTHESIS",
+      "requester":        "<worker_id>",
+      "layer_index":      "<layer>",
+      "branch_id":        "<unique_branch_id>",
+      "content":          "<full generated text>",
+      "claims":           ["<claim 1>", "<claim 2>", ...],
+      "target_branch_id": null (or branch ID for challenges)
+    }
+
+  QUICK REFERENCE:
+  ----------------
+  First-time setup:    python3 jack_cli.py --setup
+  Clean slate:         python3 jack_cli.py --cleanup
+  Run swarm:           python3 jack_cli.py --layer "1.1" --workers 1 --prompt "..."
+  Inspect protocols:   python3 jack_cli.py --dump-constitution
+
+================================================================================
+"""
+
+    parser = argparse.ArgumentParser(
+        description="Jack Engine v4.1 — Adversarial AI Swarm for Brainstorming & Complex Reasoning",
+        epilog=epilog_text,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--layer", required=False,
+        help="Layer index (e.g., 1.1, 1.2, 2.3.1). Namespaces ALL state files. Use a new index for each distinct problem.")
+    parser.add_argument("--prompt", required=False,
+        help="Seed prompt for the swarm. This is the problem statement fed to every worker.")
+    parser.add_argument("--workers", type=int, default=20,
+        help="Number of async workers to spawn (default: 20). API concurrency is capped at 5 internally.")
+    parser.add_argument("--setup", action="store_true",
+        help="Interactive first-time setup wizard. Prompts for your Gemini API key and saves it to a local .env file.")
+    parser.add_argument("--cleanup", action="store_true",
+        help="Nuclear teardown failsafe. Kills ALL daemon/CLI processes, removes the UDS socket, and purges every layer state file. Run this before fresh executions.")
+    parser.add_argument("--dump-constitution", action="store_true",
+        help="Print the full embedded protocol constitution (research + agentic rules) to stdout.")
+    parser.add_argument("--mode", choices=["swarm", "native"], default="swarm",
+        help="Execution mode: 'swarm' (multi-agent adversarial, default) or 'native' (single-pass, no daemon).")
+    parser.add_argument("--dump-file", default=None,
+        help="Override path for consensus dump output. Auto-generated from --layer if omitted.")
 
     args = parser.parse_args()
 
