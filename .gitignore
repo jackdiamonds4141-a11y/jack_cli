@@ -1,0 +1,16 @@
+# Credentials and Environment
+.env
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Runtime Caches and Session States
+tmp/
+/tmp/
+*.sock
+*.json
+*.md.tmp
+
+# Protocols (contained within the code, but excluded from Git)
+Protocols/
