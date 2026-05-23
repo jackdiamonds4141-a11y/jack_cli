@@ -111,7 +111,8 @@ python3 jack_cli.py --layer "1.1" --workers 20 \
 ```
 
 - **Conductor** (`jack_cli.py`) boots the mediator daemon, seeds the task pool, spawns N async workers, and collects results.
-- **Workers** independently call the Gemini API, generating structured proposals with explicit atomic claims.
+- **Workers** independently call the Gemini API, generating proposals wrapped in robust XML tags to bypass small-model JSON serialization errors, complete with explicit atomic claims.
+- **OSINT Triangulation Pipeline** features a persistent SQLite-backed SearxNG cache, enabling zero-latency concurrent documentation lookups without API rate-limit bottlenecks.
 - **Mediator Daemon** (`data_manager.py`) serializes everything through a single Unix Domain Socket. Validates payloads, deduplicates claims, computes glow scores, enforces anchor constraints, and persists state via POSIX atomic writes (`tmp → fsync → rename`).
 - **Social State Machine** runs adversarial lifecycle phases: `GENESIS → OPEN_CHALLENGE → SYNTHESIS_PENDING → IDE_REVIEW → PROMOTED`.
 - **Embedded Constitution** — research protocols, source verification frameworks, and agentic coordination rules are baked directly into the worker system instructions. No external config files needed.

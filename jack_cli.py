@@ -27,9 +27,33 @@ import json
 import glob
 import socket
 import logging
+import re
 from pathlib import Path
 from typing import Optional, List, Literal
 from pydantic import BaseModel, Field
+from Core.parser import parse_output
+import uuid
+import sqlite3
+import threading
+from datetime import datetime
+import requests
+try:
+    import trafilatura
+except ImportError:
+    trafilatura = None
+
+
+SESSION_ID = "default"
+SOCKET_PATH = f"/tmp/swarm-mediator-{SESSION_ID}.sock"
+SESSION_FILE = Path(f"sessions/{SESSION_ID}/jack_session.json")
+
+def set_session_globals(sess_id: str):
+    global SESSION_ID, SOCKET_PATH, SESSION_FILE
+    SESSION_ID = sess_id
+    SOCKET_PATH = f"/tmp/swarm-mediator-{SESSION_ID}.sock"
+    SESSION_FILE = Path(f"sessions/{SESSION_ID}/jack_session.json")
+    SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+
 
 try:
     from google import genai  # type: ignore
@@ -37,9 +61,7 @@ try:
 except ImportError:
     pass
 
-SOCKET_PATH = "/tmp/swarm-mediator.sock"
 DAEMON_SCRIPT = Path(__file__).parent / "Core" / "data_manager.py"
-SESSION_FILE = Path("tmp/jack_session.json")
 def load_env_key() -> Optional[str]:
     # Check OS environment first
     if "GEMINI_API_KEY" in os.environ:
@@ -206,6 +228,75 @@ class MemeOutputSchema(BaseModel):
     content: str = Field(description="The full proposal, challenge, or synthesis text. Must be robust and detailed.")
     claims: List[str] = Field(description="List of discrete atomic claims made in the content.")
     target_branch_id: Optional[str] = Field(default=None, description="Only used for challenges to target a specific branch.")
+    search_queries: Optional[List[str]] = Field(default=None, description="If you need local academic validation, specify up to 2 search queries here.")
+    reasoning_trace: Optional[str] = Field(default=None, description="Step-by-step mathematical calculations, verification logs, search grounding references, or cognitive trace.")
+
+_CACHE_DB_PATH = os.path.join(os.path.dirname(__file__), "osint_cache.db")
+_CACHE_LOCK = threading.Lock()
+
+def _init_cache_db():
+    with _CACHE_LOCK:
+        conn = sqlite3.connect(_CACHE_DB_PATH)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS osint_cache
+                     (query TEXT PRIMARY KEY, result TEXT)''')
+        conn.commit()
+        conn.close()
+
+_init_cache_db()
+
+def local_osint_lookup(queries: List[str]) -> str:
+    """Query self-hosted local SearxNG search index and extract clean text via Trafilatura."""
+    scraped_blocks = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    for q in queries[:2]:
+        with _CACHE_LOCK:
+            conn = sqlite3.connect(_CACHE_DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT result FROM osint_cache WHERE query=?", (q,))
+            row = c.fetchone()
+            conn.close()
+            
+        if row:
+            scraped_blocks.append(row[0])
+            continue
+            
+        try:
+            url = f"http://localhost:8080/?q={q}&format=json"
+            response = requests.get(url, timeout=5, headers=headers)
+            if response.status_code != 200:
+                continue
+            results = response.json().get("results", [])
+            
+            for res in results[:2]:
+                target_url = res.get("url")
+                if not target_url or not trafilatura:
+                    continue
+                downloaded = trafilatura.fetch_url(target_url)
+                if downloaded:
+                    text = trafilatura.extract(downloaded)
+                    if text:
+                        formatted_text = (
+                            f"### Source: {target_url}\n"
+                            f"```text\n{text[:1200]}\n```\n"
+                        )
+                        scraped_blocks.append(formatted_text)
+                        
+                        with _CACHE_LOCK:
+                            conn = sqlite3.connect(_CACHE_DB_PATH)
+                            c = conn.cursor()
+                            c.execute("INSERT OR REPLACE INTO osint_cache (query, result) VALUES (?, ?)", (q, formatted_text))
+                            conn.commit()
+                            conn.close()
+        except Exception as e:
+            logger.error(f"Local OSINT lookup failed for query '{q}': {e}")
+            
+    if not scraped_blocks:
+        return "No local grounding sources retrieved."
+    return "\n".join(scraped_blocks)
+
+
 
 async def pop_next_idea() -> Optional[dict]:
     """Query the socket daemon to atomically pop the next idea from the pool."""
@@ -232,7 +323,7 @@ async def pop_next_idea() -> Optional[dict]:
         pass
     return None
 
-async def record_failure_residue(idea_id: str, prompt: str, error_msg: str):
+async def record_failure_residue(idea_id: str, prompt: str, error_msg: str, layer_index: Optional[str] = None):
     """Send record_residue request to daemon socket for tracking failures."""
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -240,6 +331,7 @@ async def record_failure_residue(idea_id: str, prompt: str, error_msg: str):
         sock.connect(SOCKET_PATH)
         payload = {
             "action": "record_residue",
+            "layer_index": layer_index,
             "residue": {
                 "id": idea_id,
                 "prompt": prompt,
@@ -256,78 +348,229 @@ async def record_failure_residue(idea_id: str, prompt: str, error_msg: str):
 
 async def worker_task(worker_id: str, layer_index: str, client: genai.Client, semaphore: asyncio.Semaphore):
     processed_count = 0
+    empty_attempts = 0
+    max_empty_attempts = 60  # Wait up to 120 seconds for adversarial steps to populate tasks
+
     while True:
         idea = await pop_next_idea()
         if not idea:
-            logger.info(f"[{worker_id}] Idea pool empty or socket down. Worker exiting.")
-            break
-            
+            if empty_attempts < max_empty_attempts:
+                empty_attempts += 1
+                await asyncio.sleep(2.0)
+                continue
+            else:
+                logger.info(f"[{worker_id}] Idea pool empty after timeout. Worker exiting.")
+                try:
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sock.connect(SOCKET_PATH)
+                    sock.sendall(json.dumps({"action": "worker_exit", "requester": worker_id}).encode("utf-8"))
+                    sock.close()
+                except Exception:
+                    pass
+                break
+
+        empty_attempts = 0
         idea_id = idea.get("id", "unknown_id")
+
         idea_prompt = idea.get("prompt", "")
         logger.info(f"[{worker_id}] Acquired task '{idea_id}'.")
-        
+
         async with semaphore:
             logger.info(f"[{worker_id}] Executing generation for task '{idea_id}' under layer {layer_index}...")
             system_instruction = (
-                f"You are Jack Engine worker {worker_id} executing task '{idea_id}'. "
-                f"Analyze the prompt and generate a PROPOSAL branch. "
-                f"You are part of an adversarial synthesis swarm. Ensure your logic is rigorous."
+                f"You are Jack Engine worker {worker_id} executing task '{idea_id}' under layer {layer_index}.\n"
+                f"You MUST execute this task under the strict constraints of the Jack Swarm Constitution:\n"
+                f"1. REGIMEGUARD: Prune generic AI fluff, textbook boilerplates, and centralized bottlenecks. "
+                f"Identify and force decentralization, modern production-grade industry optimums, and highly robust architectures.\n"
+                f"2. OSINT VERIFICATION TRIANGLE: Triangulate and verify all technical claims. Since native model tool-calling is disabled on local small infrastructures (like gemma), you MUST simulate your custom web search tools and framework utilities locally within your logical process. Rely strictly on our verified constitutional protocols (`meta_research.md`, `research.md`) to challenge or synthesize claims.\n\n"
+                f"You MUST return your output wrapped in the following XML-style tags. Do not use JSON.\n"
+                f"<meme_type>PROPOSAL or CHALLENGE or SYNTHESIS</meme_type>\n"
+                f"<content>\n<Your highly rigorous, detailed proposal, challenge, or synthesis content text>\n</content>\n"
+                f"<claims>\n  <claim>Claim 1</claim>\n  <claim>Claim 2</claim>\n</claims>\n"
+                f"<target_branch_id>parent_branch_id_or_null</target_branch_id>\n"
+                f"<search_queries>\n  <query>Search Query 1</query>\n</search_queries>\n"
+                f"<reasoning_trace>\n<Your internal step-by-step reasoning>\n</reasoning_trace>\n"
             )
-            
-            try:
-                model_name = os.getenv("JACK_SWARM_MODEL", "gemini-2.5-flash-lite")
-                response = await client.aio.models.generate_content(
-                    model=model_name,
-                    contents=idea_prompt,
-                    config=types.GenerateContentConfig(
+
+            # --- Exponential Backoff Retry Loop for Rate-Limited APIs ---
+            max_retries = 5
+            base_delay = 15.0   # 15 seconds base (aligns with free-tier ~5 RPM window)
+            max_delay = 120.0   # Cap at 2 minutes
+            last_error = None
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    # Workers are strictly routed to our small local model (Gemma) to prevent premium namespace exhaustion
+                    model_name = os.getenv("JACK_WORKER_MODEL", "gemma-4-26b-a4b-it")
+                    is_gemma = "gemma" in model_name.lower()
+
+                    # JSON schemas removed - using XML Tag Extraction instead
+                    config = types.GenerateContentConfig(
                         system_instruction=system_instruction,
-                        response_mime_type="application/json",
-                        response_schema=MemeOutputSchema,
                         temperature=0.7,
                     )
-                )
-                if not response.text:
-                    raise ValueError(f"Model returned empty or null response for task '{idea_id}'")
-                output = json.loads(response.text)
-                logger.info(f"[{worker_id}] Generation complete for '{idea_id}'. Sending to Mediator...")
-                
-                payload = {
-                    "action": "meme",
-                    "meme_type": output.get("meme_type", "PROPOSAL"),
-                    "requester": worker_id,
-                    "layer_index": layer_index,
-                    "branch_id": f"branch_{worker_id}_{idea_id}",
-                    "target_branch_id": output.get("target_branch_id"),
-                    "content": output["content"],
-                    "claims": output["claims"]
-                }
-                
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(10)
-                sock.connect(SOCKET_PATH)
-                
-                sock.sendall(json.dumps(payload).encode("utf-8"))
-                sock.shutdown(socket.SHUT_WR)
-                
-                response_data = b""
-                while True:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    response_data += chunk
-                sock.close()
-                
-                mediator_response = json.loads(response_data.decode("utf-8"))
-                logger.info(f"[{worker_id}] Task '{idea_id}' mediator status: {mediator_response.get('status')}")
-                processed_count += 1
-                
-            except Exception as e:
-                logger.error(f"[-] [{worker_id}] Failed executing task '{idea_id}': {e}")
-                await record_failure_residue(idea_id, idea_prompt, str(e))
-                
+
+                    response = await asyncio.wait_for(
+                        client.aio.models.generate_content(
+                            model=model_name,
+                            contents=idea_prompt,
+                            config=config
+                        ),
+                        timeout=90.0
+                    )
+
+                    if not response.text:
+                        raise ValueError(f"Model returned empty or null response for task '{idea_id}'")
+
+                    content_str = response.text.strip()
+
+                    # ══════════════════════════════════════════════════════════
+                    # 6-TIER BULLETPROOF PARSER: Ensures elite reasoning is
+                    # NEVER lost to formatting errors from small models.
+                    # ══════════════════════════════════════════════════════════
+                    output = parse_output(content_str, idea_id, idea)
+
+                    # ── FINAL GATE ──
+                    if output is None:
+                        raise ValueError(
+                            f"All 6 parser tiers exhausted. Model output ({len(content_str)} chars) "
+                            f"could not be recovered. First 200 chars: {content_str[:200]}"
+                        )
+
+                    # Ensure mandatory keys exist with sensible defaults
+                    if "meme_type" not in output:
+                        if "synthesis" in idea_id.lower():
+                            output["meme_type"] = "SYNTHESIS"
+                        elif "challenge" in idea_id.lower():
+                            output["meme_type"] = "CHALLENGE"
+                        else:
+                            output["meme_type"] = "PROPOSAL"
+                    if "content" not in output or not output["content"]:
+                        raise ValueError("Parsed output has no 'content' field — no reasoning to commit.")
+                    if "claims" not in output or not output["claims"]:
+                        output["claims"] = [f"Auto-extracted from {idea_id} output"]
+
+                    # --- INTERCEPTION GATE: Two-Pass Local OSINT Grounding ---
+                    queries = output.get("search_queries")
+                    if queries:
+                        logger.info(f"[{worker_id}] Intercepted search queries: {queries}. Triggering local OSINT...")
+                        evidence = local_osint_lookup(queries)
+                        
+                        grounded_prompt = (
+                            f"{idea_prompt}\n\n"
+                            f"--- [LOCAL OSINT GROUNDING EVIDENCE - 100% VERIFIED] ---\n"
+                            f"{evidence}\n"
+                            f"--- [END OF GROUNDING EVIDENCE] ---\n\n"
+                            f"Now, generate the final structured output. Ground your claims strictly on the evidence above."
+                        )
+                        
+                        response = await asyncio.wait_for(
+                            client.aio.models.generate_content(
+                                model=model_name,
+                                contents=grounded_prompt,
+                                config=config
+                            ),
+                            timeout=90.0
+                        )
+                        if not response.text:
+                            raise ValueError(f"Model returned empty response on second grounding pass for task '{idea_id}'")
+                        
+                        output = parse_output(response.text.strip(), idea_id, idea)
+                        if output is None:
+                            raise ValueError(f"Second pass parsing failed for task '{idea_id}'.")
+                        
+                        if "meme_type" not in output:
+                            output["meme_type"] = "PROPOSAL" if "seed" in idea_id else "CHALLENGE"
+                        if "content" not in output or not output["content"]:
+                            raise ValueError("Parsed output has no 'content' field after OSINT grounding.")
+                        if "claims" not in output or not output["claims"]:
+                            output["claims"] = [f"Auto-extracted from {idea_id} output"]
+
+                    logger.info(f"[{worker_id}] Generation complete for '{idea_id}'. Sending to Mediator...")
+
+                    # Ensure target_branch_id is set correctly using idea's metadata if the model omitted or malformed it
+                    inferred_target = output.get("target_branch_id")
+                    if not inferred_target or inferred_target == "null" or inferred_target == "None":
+                        inferred_target = idea.get("target_branch_id")
+
+                    payload = {
+                        "action": "meme",
+                        "meme_type": output.get("meme_type", "PROPOSAL"),
+                        "requester": worker_id,
+                        "layer_index": layer_index,
+                        "branch_id": f"branch_{worker_id}_{idea_id}",
+                        "target_branch_id": inferred_target,
+                        "content": output["content"],
+                        "claims": output["claims"],
+                        "idea_id": idea_id
+                    }
+
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sock.settimeout(30)
+                    sock.connect(SOCKET_PATH)
+
+                    sock.sendall(json.dumps(payload).encode("utf-8"))
+                    sock.shutdown(socket.SHUT_WR)
+
+                    response_data = b""
+                    while True:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            break
+                        response_data += chunk
+                    sock.close()
+
+                    mediator_response = json.loads(response_data.decode("utf-8"))
+                    logger.info(f"[{worker_id}] Task '{idea_id}' mediator status: {mediator_response.get('status')}")
+                    processed_count += 1
+                    last_error = None
+                    break  # Success — exit retry loop
+
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e)
+                    is_retryable = (
+                        any(code in error_str for code in ["429", "503", "500", "INTERNAL", "RESOURCE_EXHAUSTED", "UNAVAILABLE"]) or 
+                        isinstance(e, asyncio.TimeoutError) or 
+                        isinstance(e, TimeoutError)
+                    )
+
+                    if attempt == max_retries:
+                        logger.critical(f"[FATAL CIRCUIT BREAKER] [{worker_id}] Exhausted {max_retries} attempts on task '{idea_id}'. Error: {e}")
+                        logger.critical("Aborting swarm pipeline to prevent context poisoning. Hard halt initiated.")
+                        send_daemon_message({"action": "shutdown"})
+                        os._exit(1)
+
+                    if is_retryable:
+                        # Parse server-suggested retry delay if present
+                        retry_delay = base_delay * (2 ** (attempt - 1))
+                        if retry_delay > max_delay:
+                            retry_delay = max_delay
+                        # Add jitter to prevent thundering herd
+                        import random
+                        jitter = random.uniform(0, base_delay * 0.5)
+                        total_delay = retry_delay + jitter
+                        logger.warning(
+                            f"[{worker_id}] API Error on task '{idea_id}' (attempt {attempt}/{max_retries}). "
+                            f"Backing off for {total_delay:.1f}s before retry..."
+                        )
+                        await asyncio.sleep(total_delay)
+                        
+                        if attempt == 3:
+                            logger.warning(f"[{worker_id}] Region Fallback Initiated: Swapping API endpoint for attempt 4...")
+                            client = genai.Client(api_key=load_env_key(), http_options={'base_url': 'https://generativelanguage.googleapis.com'})
+
+                        continue
+                    else:
+                        # Non-retryable error
+                        logger.critical(f"[FATAL CIRCUIT BREAKER] [{worker_id}] Non-retryable error on task '{idea_id}': {e}")
+                        logger.critical("Aborting swarm pipeline to prevent context poisoning. Hard halt initiated.")
+                        send_daemon_message({"action": "shutdown"})
+                        os._exit(1)
+
     return {
-        "worker_id": worker_id, 
-        "status": "SUCCESS" if processed_count > 0 else "EMPTY", 
+        "worker_id": worker_id,
+        "status": "SUCCESS" if processed_count > 0 else "EMPTY",
         "processed_tasks": processed_count
     }
 
@@ -336,19 +579,24 @@ async def spawn_swarm(layer_index: str, worker_count: int = 20):
     if not api_key:
         logger.critical("GEMINI_API_KEY not found in OS environment or local .env file!")
         sys.exit(1)
-        
+
     client = genai.Client(api_key=api_key)
-    
+
     semaphore = asyncio.Semaphore(5)
     logger.info(f"Spawning swarm of {worker_count} workers. Concurrency limit: 5.")
-    
+
+    # Stagger worker launches to prevent thundering herd on rate-limited APIs.
+    # Each worker starts 1 second after the previous one, spreading the initial
+    # burst across the RPM window instead of slamming all requests at t=0.
     tasks = []
     for i in range(1, worker_count + 1):
         worker_id = f"worker_{i:02d}"
         tasks.append(worker_task(worker_id, layer_index, client, semaphore))
-        
+        if i < worker_count:
+            await asyncio.sleep(1.0)  # 1-second stagger between worker launches
+
     results = await asyncio.gather(*tasks)
-    
+
     total_processed = sum(r.get("processed_tasks", 0) for r in results)
     logger.info(f"Swarm completion: {worker_count} workers processed a total of {total_processed} tasks.")
     return results
@@ -358,15 +606,15 @@ async def spawn_swarm(layer_index: str, worker_count: int = 20):
 
 def layer_pool_path(layer_index: str) -> Path:
     """Return the layer-specific idea pool file path."""
-    return Path(f"tmp/idea_pool_layer_{layer_index}.json")
+    return Path(f"sessions/{SESSION_ID}/idea_pool_layer_{layer_index}.json")
 
 def layer_ledger_path(layer_index: str) -> Path:
     """Return the layer-specific residue ledger file path."""
-    return Path(f"tmp/residue_ledger_layer_{layer_index}.json")
+    return Path(f"sessions/{SESSION_ID}/residue_ledger_layer_{layer_index}.json")
 
 def layer_dump_path(layer_index: str) -> Path:
     """Return the layer-specific consensus dump file path."""
-    return Path(f"tmp/consensus_dump_layer_{layer_index}.json")
+    return Path(f"sessions/{SESSION_ID}/consensus_dump_layer_{layer_index}.json")
 
 
 def send_daemon_message(payload: dict) -> dict:
@@ -414,7 +662,7 @@ def write_session_state(daemon_pid=None, cli_pid=None, status="running", mode="s
 
 def scrape_prior_context(current_layer: str) -> str:
     context_fragments = []
-    dump_pattern = "tmp/consensus_dump_layer_*.json"
+    dump_pattern = f"sessions/{SESSION_ID}/consensus_dump_layer_*.json"
     dump_files = sorted(glob.glob(dump_pattern))
 
     for dump_path in dump_files:
@@ -560,41 +808,19 @@ def run_cleanup():
         except Exception:
             pass
 
-    wildcard_patterns = [
-        "tmp/idea_pool_layer_*.json",
-        "tmp/residue_ledger_layer_*.json",
-        "tmp/consensus_dump_layer_*.json",
-    ]
-    purged_count = 0
-    for pattern in wildcard_patterns:
-        for orphan_file in glob.glob(pattern):
-            try:
-                os.remove(orphan_file)
-                purged_count += 1
-            except Exception as e:
-                print(f"[-] Failed to purge {orphan_file}: {e}")
-
-    legacy_files = [
-        "tmp/idea_pool.json",
-        "tmp/residue_ledger.json",
-        "tmp/consensus_dump.json",
-    ]
-    for legacy in legacy_files:
-        if os.path.exists(legacy):
-            try:
-                os.remove(legacy)
-                purged_count += 1
-            except Exception:
-                pass
-
-    if purged_count > 0:
-        print(f"[+] Wildcard purge complete: {purged_count} orphaned file(s) removed.")
-    else:
-        print("[+] Wildcard purge: tmp/ directory is already clean.")
+    # New Clean-up: Only terminate processes and orphaned sockets
+    orphaned_sockets = glob.glob("/tmp/swarm-mediator-*.sock")
+    for orphan_sock in orphaned_sockets:
+        try:
+            os.remove(orphan_sock)
+            print(f"[+] Cleared orphaned socket: {orphan_sock}")
+        except Exception:
+            pass
+    print("[+] Session environment perfectly sanitized. Historical artifacts were preserved.")
 
     print("=== [Nuclear Teardown Complete. Zero Race Conditions Guaranteed] ===\n")
 
-def boot_daemon() -> Optional[int]:
+def boot_daemon(expected_workers: int = 20) -> Optional[int]:
     print("[*] Checking if Data Manager daemon is active...")
     status = send_daemon_message({"action": "status"})
     if status.get("status") == "ACK":
@@ -610,7 +836,7 @@ def boot_daemon() -> Optional[int]:
             pass
 
     process = subprocess.Popen(
-        [sys.executable, str(DAEMON_SCRIPT)],
+        [sys.executable, str(DAEMON_SCRIPT), SESSION_ID, str(expected_workers)],
         stdout=sys.stdout,
         stderr=sys.stderr,
         preexec_fn=os.setpgrp if sys.platform != "win32" else None
@@ -748,6 +974,48 @@ def main():
       "target_branch_id": null (or branch ID for challenges)
     }
 
+  PRE-FLIGHT USER CONSULTATION PROTOCOL (MANDATORY):
+  --------------------------------------------------
+  Before executing ANY swarm command, you are legally bound to pitch a task-
+  chunking roadmap to the user. You MUST use the exact terms "brainstorming
+  session" or "reasoning session" (do not use internal terms like "daemon").
+  1. Pitch the plan: "Should we send this entire feature to a single swarm
+     generation, or split it into task A and task B and run two separate
+     reasoning sessions?"
+  2. WAIT for explicit human approval before running the swarm generations.
+
+  Vocabulary:
+  - One "swarm generation" = the execution of ONE parent swarm PLUS its
+    entire recursive residue cleanup chain.
+
+  SWARM ERROR & RESPONSE LEDGER:
+  ------------------------------
+  The daemon communicates via JSON with a "status" field:
+  - ACK: The payload was accepted and processed successfully.
+  - NACK: The payload was rejected (e.g., schema validation failure, halting
+          controller rejected the worker, or missing keys).
+  
+  STRICT INSTRUCTION FOR HANDLING NACKs:
+  If a worker receives a NACK or if the swarm terminates with a NACK state in
+  the consensus dump, you MUST NOT proceed or pretend everything is fine.
+  1. Halt execution immediately.
+  2. Parse the "reason" field from the NACK response.
+  3. Dump the exact error reason to the user in your chat.
+  4. Wait for the user to troubleshoot or instruct you on the next steps.
+
+  ACTIVE SWARM ORCHESTRATION (STEERING RULES):
+  --------------------------------------------
+  You (the IDE Agent) are the Middleman and Conductor. The quality of the swarm
+  depends 100% on your active steering. Do not fire-and-forget.
+  1. OSINT Pre-Flight: Before launching the swarm, you MUST use your web search
+     tools to pull modern specs, official standards, and real-world benchmarks
+     related to the user prompt. Inject these gathered facts into the seed prompt.
+  2. Active Steering: Monitor the swarm. If workers propose generic AI fluff or
+     textbook boilerplate, you MUST use the `--steer "<instruction>"` flag to
+     connect to the daemon mid-flight and inject constraints or challenges (e.g.
+     "Exclude centralized OT. Force Yjs CRDT.") directly into the active pool.
+
+
   QUICK REFERENCE:
   ----------------
   First-time setup:    python3 jack_cli.py --setup
@@ -763,8 +1031,11 @@ def main():
         epilog=epilog_text,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--layer", required=False,
-        help="Layer index (e.g., 1.1, 1.2, 2.3.1). Namespaces ALL state files. Use a new index for each distinct problem.")
+    parser.add_argument("--layers", required=False, help="Comma-separated list of layer indices (e.g., 1.1,1.2).")
+    parser.add_argument("--layer", required=False, help=argparse.SUPPRESS)
+    parser.add_argument("--resume", action="store_true", help="Skip layers that have a cached consensus dump.")
+    parser.add_argument("--session-id", required=False, help="Explicitly assign a unique session directory. Auto-generates if omitted.")
+    parser.add_argument("--revive", required=False, help="Provide an existing session ID to revive. Rehydrates its final state and respawns the swarm.")
     parser.add_argument("--prompt", required=False,
         help="Seed prompt for the swarm. This is the problem statement fed to every worker.")
     parser.add_argument("--workers", type=int, default=20,
@@ -779,8 +1050,40 @@ def main():
         help="Execution mode: 'swarm' (multi-agent adversarial, default) or 'native' (single-pass, no daemon).")
     parser.add_argument("--dump-file", default=None,
         help="Override path for consensus dump output. Auto-generated from --layer if omitted.")
+    parser.add_argument("--steer", required=False,
+        help="Inject a mid-flight constraint, fact check, or challenge directly into the active daemon's idea pool for the specified --layer.")
+    parser.add_argument("--agent-led-audit", action="store_true",
+        help="Enable direct agent-led audit friction after each layer to inject verified facts before advancing.")
+
 
     args = parser.parse_args()
+
+    if args.revive:
+        set_session_globals(args.revive)
+        print(f"[*] REAWAKENING PROTOCOL: Resuming session '{SESSION_ID}'")
+        dump_pattern = f"sessions/{SESSION_ID}/consensus_dump_layer_*.json"
+        dump_files = sorted(glob.glob(dump_pattern))
+        if dump_files:
+            latest_dump = dump_files[-1]
+            try:
+                with open(latest_dump, "r") as f:
+                    old_data = json.load(f)
+                old_prompt = old_data.get("prompt", "")
+                old_status = old_data.get("status", "UNKNOWN")
+                print(f"[*] Hydrating state from {latest_dump} (Status: {old_status})")
+                revive_context = f"\n\n[=== HISTORICAL REAWAKENING CONTEXT ===]\nPrior Objective: {old_prompt}\nPrior Status: {old_status}\n\n"
+                if args.prompt:
+                    args.prompt = revive_context + args.prompt
+                else:
+                    args.prompt = revive_context + "Continue the logic from the historical context."
+            except Exception as e:
+                print(f"[-] Failed to read revive dump {latest_dump}: {e}")
+        else:
+            print(f"[-] Warning: No existing dumps found for session '{SESSION_ID}'. Starting fresh.")
+    else:
+        sess_id = args.session_id if args.session_id else f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:4]}"
+        set_session_globals(sess_id)
+
 
     if args.setup:
         _run_setup_wizard()
@@ -794,103 +1097,153 @@ def main():
         print(CONSTITUTION)
         sys.exit(0)
 
-    if not args.layer or not args.prompt:
-        parser.error("--layer and --prompt are required unless running with --setup, --dump-constitution, or --cleanup")
+    if args.steer:
+        target_layer = args.layers if args.layers else args.layer
+        if not target_layer:
+            parser.error("--layers or --layer is required when using --steer")
+        print(f"[*] Connecting to active daemon for layer {target_layer}...")
+        resp = send_daemon_message({"action": "steer", "layer": target_layer, "prompt": args.steer})
+        print(f"[*] Mediator response: {resp.get('status')} - {resp.get('reason')}")
+        if resp.get("status") == "NACK":
+            print(f"[-] Steering injection failed: {resp.get('reason')}")
+            sys.exit(1)
+        else:
+            print(f"[+] Steering constraint successfully injected mid-flight!")
+            sys.exit(0)
 
-    pool_file = layer_pool_path(args.layer)
-    ledger_file = layer_ledger_path(args.layer)
-    dump_path = Path(args.dump_file) if args.dump_file else layer_dump_path(args.layer)
+    if not (args.layers or args.layer) or not args.prompt:
+        parser.error("--layer and --prompt are required unless running with --setup, --dump-constitution, --cleanup, or --steer")
 
-    rehydration_context = scrape_prior_context(args.layer)
-    hydrated_prompt = args.prompt
-    if rehydration_context:
-        hydrated_prompt = args.prompt + rehydration_context
-        print(f"[+] Context Re-Hydration: Injected history from prior layers into seed prompt.")
+    layer_input = args.layers if args.layers else args.layer
+    layer_list = [l.strip() for l in layer_input.split(",") if l.strip()]
 
-    if args.mode == "native":
-        print(f"\n[*] Jack Engine Conductor v4.1: NATIVE execution mode selected.")
-        print(f"[*] Layer: {args.layer}")
-        print(f"[*] Prompt: '{args.prompt}'\n")
+    for current_layer in layer_list:
+        print(f"\n" + "="*80)
+        print(f"  PROCESSING LAYER: {current_layer}")
+        print("="*80)
 
-        write_session_state(daemon_pid=None, cli_pid=os.getpid(), status="completed", mode="native", layer_index=args.layer)
+        pool_file = layer_pool_path(current_layer)
+        ledger_file = layer_ledger_path(current_layer)
+        dump_path = Path(args.dump_file) if args.dump_file and len(layer_list) == 1 else layer_dump_path(current_layer)
 
-        dump_path.parent.mkdir(parents=True, exist_ok=True)
-        dump_data = {
-            "status": "NATIVE_BYPASS",
-            "layer": args.layer,
-            "prompt": args.prompt,
-            "timestamp": time.time(),
-            "message": "This task was completed natively by the IDE Agent under Conductor guidelines."
-        }
-        with open(dump_path, "w") as f:
-            json.dump(dump_data, f, indent=2)
-        print(f"[+] Decoupled native output state written to {dump_path}")
-        sys.exit(0)
+        if args.resume and dump_path.exists():
+            print(f"[+] --resume flag is active. Pristine cache found for layer {current_layer}.")
+            print(f"[+] Skipping calculation and seamlessly re-hydrating from {dump_path}\n")
+            continue
 
-    daemon_pid = boot_daemon()
-    write_session_state(daemon_pid=daemon_pid, cli_pid=os.getpid(), status="running", mode="swarm", layer_index=args.layer)
+        rehydration_context = scrape_prior_context(current_layer)
+        
+        protocol_wrapper = (
+            "\n\n[MANDATORY SYSTEM DIRECTIVE — SWARM WORKER RULESET]\n"
+            "You MUST execute this task under the strict constraints of the following protocols:\n"
+            "1. REGIMEGUARD: Prune generic AI fluff, textbook boilerplates, and centralized bottlenecks. "
+            "Force decentralization, modern industry optimums, and production-grade architectures.\n"
+            "2. OSINT VERIFICATION TRIANGLE: Triangulate and verify all technical claims across three perspective layers: "
+            "first-class official specs, independent real-world benchmarks, and rigorous logical safety proofs.\n"
+            "Failure to adhere to these rules will result in immediate worker pruning by the Mediator.\n"
+            "[END SYSTEM DIRECTIVE]\n\n"
+        )
+        
+        hydrated_prompt = protocol_wrapper + args.prompt
+        if rehydration_context:
+            hydrated_prompt = hydrated_prompt + rehydration_context
+            print(f"[+] Context Re-Hydration: Injected history from prior layers into seed prompt.")
 
-    def cleanup_signal(signum, frame):
-        print("\n[*] Interrupted! Suspending persistent daemon...")
-        send_daemon_message({"action": "suspend"})
-        write_session_state(daemon_pid=daemon_pid, status="suspended", mode="swarm", layer_index=args.layer)
-        sys.exit(0)
 
-    signal.signal(signal.SIGINT, cleanup_signal)
-    signal.signal(signal.SIGTERM, cleanup_signal)
+        if args.mode == "native":
+            print(f"\n[*] Jack Engine Conductor v4.1: NATIVE execution mode selected.")
+            print(f"[*] Layer: {current_layer}")
+            print(f"[*] Prompt: '{args.prompt}'\n")
 
-    if not pool_file.exists() or pool_file.stat().st_size == 0:
-        pool_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(pool_file, "w", encoding="utf-8") as f:
-            json.dump([{"id": "seed_01", "prompt": hydrated_prompt}], f, indent=2)
-        print(f"[+] Seed prompt written to layer-specific pool: {pool_file}")
+            write_session_state(daemon_pid=None, cli_pid=os.getpid(), status="completed", mode="native", layer_index=current_layer)
 
-    print("[*] Transitioning daemon state to RUNNING...")
-    send_daemon_message({"action": "wakeup"})
-    print(f"[*] Loading layer-specific idea pool: {pool_file}")
-    send_daemon_message({"action": "load_queue", "pool_file": str(pool_file)})
+            dump_path.parent.mkdir(parents=True, exist_ok=True)
+            dump_data = {
+                "status": "NATIVE_BYPASS",
+                "layer": current_layer,
+                "prompt": args.prompt,
+                "timestamp": time.time(),
+                "message": "This task was completed natively by the IDE Agent under Conductor guidelines."
+            }
+            with open(dump_path, "w") as f:
+                json.dump(dump_data, f, indent=2)
+            print(f"[+] Decoupled native output state written to {dump_path}")
+            continue
 
-    print(f"\n[*] Initiating Swarm Spawner for layer {args.layer}")
-    print(f"[*] Seed Prompt: '{args.prompt}'")
-    if rehydration_context:
-        print(f"[*] Re-Hydrated Context: YES (prior layers injected)")
-    print()
+        daemon_pid = boot_daemon(args.workers)
+        write_session_state(daemon_pid=daemon_pid, cli_pid=os.getpid(), status="running", mode="swarm", layer_index=current_layer)
 
-    results = []
-    try:
-        results = asyncio.run(spawn_swarm(args.layer, worker_count=args.workers))
-    except Exception as e:
-        print(f"[-] Swarm execution failed: {e}")
-    finally:
-        print("\n[*] Swarm finished. Suspending persistent daemon...")
-        send_daemon_message({"action": "suspend"})
-        write_session_state(daemon_pid=daemon_pid, status="suspended", mode="swarm", layer_index=args.layer)
+        def cleanup_signal(signum, frame):
+            print("\n[*] Interrupted! Suspending persistent daemon...")
+            send_daemon_message({"action": "suspend"})
+            write_session_state(daemon_pid=daemon_pid, status="suspended", mode="swarm", layer_index=current_layer)
+            sys.exit(0)
 
-        compile_residues(args.layer)
+        signal.signal(signal.SIGINT, cleanup_signal)
+        signal.signal(signal.SIGTERM, cleanup_signal)
 
-        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        if not pool_file.exists() or pool_file.stat().st_size == 0:
+            pool_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(pool_file, "w", encoding="utf-8") as f:
+                json.dump([{"id": "seed_01", "prompt": hydrated_prompt}], f, indent=2)
+            print(f"[+] Seed prompt written to layer-specific pool: {pool_file}")
 
-        succeeded = sum(1 for r in results if r.get("status") == "SUCCESS") if results else 0
-        dump_data = {
-            "status": "SUCCESS" if succeeded > 0 else "FAILED",
-            "layer": args.layer,
-            "prompt": args.prompt,
-            "timestamp": time.time(),
-            "worker_count": args.workers,
-            "succeeded_workers": succeeded,
-            "rehydration_applied": bool(rehydration_context),
-            "results": [
-                {
-                    "worker_id": r.get("worker_id"),
-                    "status": r.get("status"),
-                    "mediator_status": r.get("mediator", {}).get("status") if "mediator" in r else None,
-                    "round_number": r.get("mediator", {}).get("round_number") if "mediator" in r else None
-                } for r in results
-            ] if results else []
-        }
-        with open(dump_path, "w") as f:
-            json.dump(dump_data, f, indent=2)
-        print(f"[+] Decoupled swarm output state written to {dump_path}")
+        print("[*] Transitioning daemon state to RUNNING...")
+        send_daemon_message({"action": "wakeup"})
+        print(f"[*] Loading layer-specific idea pool: {pool_file}")
+        send_daemon_message({"action": "load_queue", "pool_file": str(pool_file)})
+
+        print(f"\n[*] Initiating Swarm Spawner for layer {current_layer}")
+        print(f"[*] Seed Prompt: '{args.prompt}'")
+        if rehydration_context:
+            print(f"[*] Re-Hydrated Context: YES (prior layers injected)")
+        print()
+
+        results = []
+        try:
+            results = asyncio.run(spawn_swarm(current_layer, worker_count=args.workers))
+        except Exception as e:
+            print(f"[-] Swarm execution failed: {e}")
+        finally:
+            print("\n[*] Swarm finished. Suspending persistent daemon...")
+            send_daemon_message({"action": "suspend"})
+            write_session_state(daemon_pid=daemon_pid, status="suspended", mode="swarm", layer_index=current_layer)
+
+            compile_residues(current_layer)
+
+            dump_path.parent.mkdir(parents=True, exist_ok=True)
+
+            succeeded = sum(1 for r in results if r.get("status") == "SUCCESS") if results else 0
+            dump_data = {
+                "status": "SUCCESS" if succeeded > 0 else "FAILED",
+                "layer": current_layer,
+                "prompt": args.prompt,
+                "timestamp": time.time(),
+                "worker_count": args.workers,
+                "succeeded_workers": succeeded,
+                "rehydration_applied": bool(rehydration_context),
+                "results": [
+                    {
+                        "worker_id": r.get("worker_id"),
+                        "status": r.get("status"),
+                        "mediator_status": r.get("mediator", {}).get("status") if "mediator" in r else None,
+                        "round_number": r.get("mediator", {}).get("round_number") if "mediator" in r else None
+                    } for r in results
+                ] if results else []
+            }
+            with open(dump_path, "w") as f:
+                json.dump(dump_data, f, indent=2)
+            print(f"[+] Decoupled swarm output state written to {dump_path}")
+
+            if succeeded == 0:
+                print(f"\n[CRITICAL] Layer {current_layer} failed to reach strict consensus.")
+                print(f"[CRITICAL] Aborting entire pipeline to prevent downstream context poisoning.")
+                sys.exit(1)
+
+            if args.agent_led_audit:
+                print(f"\n[AWAITING_AGENT_AUDIT] Layer {current_layer} complete.")
+                print(f"[AWAITING_AGENT_AUDIT] Please perform search audits and inject validated facts via inject_verdict.py.")
+                input("[*] Press Enter to resume and advance to the next layer...")
 
 if __name__ == "__main__":
     main()

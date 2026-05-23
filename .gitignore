@@ -14,3 +14,6 @@ tmp/
 
 # Protocols (contained within the code, but excluded from Git)
 Protocols/
+
+# Test Outputs
+demo_react_app/

@@ -1,5 +1,6 @@
 # Core/social_state_machine.py
 #!/usr/bin/env python3
+
 """
 Social Memetic State Machine (Intelligence Layer)
 =================================================
@@ -8,6 +9,7 @@ Lifecycle: GENESIS -> OPEN_CHALLENGE -> SYNTHESIS_PENDING -> IDE_REVIEW -> PROMO
 """
 
 import hashlib
+import time
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Optional
@@ -339,6 +341,10 @@ class SocialStateMachine:
         self.glow_engine = GlowEngine()
         self.crossover_gate = CrossoverGate()
         self.glow_history: List[Dict] = []             # Per-round snapshots
+        self.expected_tasks = {"seed_01"}
+        self.completed_tasks = set()
+        self.phase_start_time = 0.0
+
 
     def ingest_tweet(self, tweet: Dict) -> Dict:
         """
@@ -363,29 +369,291 @@ class SocialStateMachine:
         return {"status": "NACK", "reason": f"Unknown phase state: {self.phase}"}
 
     def _handle_genesis(self, tweet: Dict) -> Dict:
+        branch_id = tweet.get("branch_id")
+        claims = tweet.get("claims", [])
+        claim_ids = set(self.claim_registry._hash_claim(c) for c in claims)
+
+        # Register claims
+        self.claim_registry.register_claims(
+            tweet.get("requester"),
+            claims,
+            self.round_number,
+            self.worker_count
+        )
+
+        # Build branch and compute glow score
+        branch = Branch(
+            branch_id=branch_id,
+            worker_id=tweet.get("requester"),
+            layer_index=self.layer_index,
+            content=tweet.get("content"),
+            claim_ids=claim_ids,
+            created_round=self.round_number,
+            phase_at_creation=self.phase
+        )
+        self.branches[branch_id] = branch
+        branch.glow_score = self.glow_engine.compute_glow(
+            branch,
+            list(self.branches.values()),
+            self.claim_registry,
+            self.round_number
+        )
+
+        # Dynamic generation of adversarial challenges
+        new_ideas = []
+        for claim_text in claims:
+            claim_hash = self.claim_registry._hash_claim(claim_text)
+            challenge_prompt = (
+                f"CHALLENGE PROMPT: The following claim has been asserted in Layer {self.layer_index}: '{claim_text}'.\n"
+                f"Under the strict constraints of the Swarm Constitution (REGIMEGUARD and OSINT Verification Triangle):\n"
+                f"1. Critically analyze and challenge this claim.\n"
+                f"2. Identify at least 3 concrete failure modes, scalability limits, or architectural vulnerabilities associated with it.\n"
+                f"3. Propose a precise, highly optimized decentralized counter-measure or mitigation.\n\n"
+                f"Formulate your response as an adversarial CHALLENGE branch targeting parent branch '{branch_id}'."
+            )
+            new_ideas.append({
+                "id": f"challenge_{claim_hash[:8]}",
+                "prompt": challenge_prompt,
+                "description": f"Adversarial challenge targeting claim: {claim_hash[:12]}",
+                "classification": "SWARM",
+                "target_branch_id": branch_id
+            })
+
+        self.phase = SwarmPhase.OPEN_CHALLENGE
+        self.round_number += 1
+        
+        # Track dynamically generated challenges for the round barrier
+        import time
+        self.expected_tasks = {idea["id"] for idea in new_ideas}
+        self.completed_tasks = set()
+        self.phase_start_time = time.time()
+
         return {
-            "status": "ACK", 
-            "reason": "Tweet ingested into GENESIS phase (Stub)", 
-            "current_phase": self.phase.value
+            "status": "ACK",
+            "reason": f"Ingested GENESIS proposal '{branch_id}' and generated {len(new_ideas)} adversarial challenges.",
+            "current_phase": self.phase.value,
+            "new_ideas": new_ideas
         }
+
+
 
     def _handle_challenge(self, tweet: Dict) -> Dict:
-        return {
-            "status": "ACK", 
-            "reason": "Tweet ingested into OPEN_CHALLENGE phase (Stub)", 
-            "current_phase": self.phase.value
+        branch_id = tweet.get("branch_id")
+        target_branch_id = tweet.get("target_branch_id")
+
+        if not target_branch_id or target_branch_id not in self.branches:
+            return {
+                "status": "NACK",
+                "reason": f"Challenge target_branch_id '{target_branch_id}' not found in active branches.",
+                "current_phase": self.phase.value
+            }
+
+        idea_id = tweet.get("idea_id")
+        if not idea_id:
+            parts = branch_id.split("_")
+            if len(parts) >= 3:
+                idea_id = "_".join(parts[2:])
+
+        claims = tweet.get("claims", [])
+        claim_ids = set(self.claim_registry._hash_claim(c) for c in claims)
+
+        # Register claims
+        self.claim_registry.register_claims(
+            tweet.get("requester"),
+            claims,
+            self.round_number,
+            self.worker_count
+        )
+
+        # Build challenge branch
+        branch = Branch(
+            branch_id=branch_id,
+            worker_id=tweet.get("requester"),
+            layer_index=self.layer_index,
+            content=tweet.get("content"),
+            claim_ids=claim_ids,
+            created_round=self.round_number,
+            phase_at_creation=self.phase
+        )
+        self.branches[branch_id] = branch
+        branch.glow_score = self.glow_engine.compute_glow(
+            branch,
+            list(self.branches.values()),
+            self.claim_registry,
+            self.round_number
+        )
+
+        # Record challenge under parent branch
+        challenge_meta = {
+            "branch_id": branch_id,
+            "worker_id": tweet.get("requester"),
+            "content": tweet.get("content")
         }
+        self.branches[target_branch_id].challenges_received.append(challenge_meta)
+
+        # Add to completed tasks
+        if idea_id:
+            self.completed_tasks.add(idea_id)
+
+        # Check round barrier — strictly task-completion-driven, no timeout fallback.
+        # Workers implement their own retry/backoff against rate limits, so we wait
+        # patiently for every single expected task to report in.
+        barrier_cleared = len(self.completed_tasks) >= len(self.expected_tasks)
+
+        if not barrier_cleared:
+            return {
+                "status": "ACK",
+                "reason": f"Ingested CHALLENGE branch '{branch_id}'. Barrier progress: {len(self.completed_tasks)}/{len(self.expected_tasks)} tasks completed. Waiting for others.",
+                "current_phase": self.phase.value,
+                "new_ideas": []
+            }
+
+        # Barrier cleared! Construct consolidated Synthesis prompt merging all challenges
+        challenge_contents = []
+        for b in self.branches.values():
+            if b.phase_at_creation == SwarmPhase.OPEN_CHALLENGE:
+                challenge_contents.append(f"Challenge by {b.worker_id}:\n{b.content}")
+
+        proposal_content = self.branches[target_branch_id].content
+        
+        synthesis_prompt = (
+            f"SYNTHESIS PROMPT: You are the Synthesis Engine. Your task is to resolve the tension and merge:\n"
+            f"1. PROPOSAL Branch '{target_branch_id}':\n{proposal_content}\n\n"
+            f"2. CHALLENGES received:\n" + "\n\n".join(challenge_contents) + "\n\n"
+            f"Under the strict constraints of the Swarm Constitution (REGIMEGUARD and OSINT Verification Triangle), you MUST synthesize a reconciled architecture:\n"
+            f"- Directly address and resolve all critical vulnerabilities, edge cases, and failure modes highlighted in the challenges.\n"
+            f"- Retain the core decentralization and structural benefits of the original proposal.\n"
+            f"- Design a highly optimized, fully consistent specification incorporating clear mitigations."
+        )
+
+        synthesis_id = f"synthesis_{self.layer_index.replace('.', '_')}"
+        new_ideas = [{
+            "id": synthesis_id,
+            "prompt": synthesis_prompt,
+            "description": f"Synthesis merging proposal '{target_branch_id}' and all {len(challenge_contents)} active challenges",
+            "classification": "SWARM",
+            "target_branch_id": target_branch_id
+        }]
+
+        self.phase = SwarmPhase.SYNTHESIS_PENDING
+        self.round_number += 1
+        self.expected_tasks = {synthesis_id}
+        self.completed_tasks = set()
+        self.phase_start_time = time.time()
+
+        return {
+            "status": "ACK",
+            "reason": f"Round barrier cleared ({len(self.completed_tasks)}/{len(self.expected_tasks)}). Ingested CHALLENGE branch '{branch_id}' and generated consolidated SYNTHESIS task.",
+            "current_phase": self.phase.value,
+            "new_ideas": new_ideas
+        }
+
 
     def _handle_synthesis(self, tweet: Dict) -> Dict:
+        branch_id = tweet.get("branch_id")
+        target_branch_id = tweet.get("target_branch_id")
+
+        if not target_branch_id or target_branch_id not in self.branches:
+            return {
+                "status": "NACK",
+                "reason": f"Synthesis target_branch_id '{target_branch_id}' not found in active branches.",
+                "current_phase": self.phase.value
+            }
+
+        idea_id = tweet.get("idea_id")
+        if not idea_id:
+            parts = branch_id.split("_")
+            if len(parts) >= 3:
+                idea_id = "_".join(parts[2:])
+
+        claims = tweet.get("claims", [])
+        claim_ids = set(self.claim_registry._hash_claim(c) for c in claims)
+
+        # Register claims
+        self.claim_registry.register_claims(
+            tweet.get("requester"),
+            claims,
+            self.round_number,
+            self.worker_count
+        )
+
+        # Build synthesis branch
+        branch = Branch(
+            branch_id=branch_id,
+            worker_id=tweet.get("requester"),
+            layer_index=self.layer_index,
+            content=tweet.get("content"),
+            claim_ids=claim_ids,
+            created_round=self.round_number,
+            phase_at_creation=self.phase
+        )
+        self.branches[branch_id] = branch
+        branch.glow_score = self.glow_engine.compute_glow(
+            branch,
+            list(self.branches.values()),
+            self.claim_registry,
+            self.round_number
+        )
+
+        # Add to completed tasks
+        if idea_id:
+            self.completed_tasks.add(idea_id)
+
+        # Check round barrier — strictly task-completion-driven, no timeout fallback.
+        barrier_cleared = len(self.completed_tasks) >= len(self.expected_tasks)
+
+        if not barrier_cleared:
+            return {
+                "status": "ACK",
+                "reason": f"Ingested SYNTHESIS branch '{branch_id}'. Barrier progress: {len(self.completed_tasks)}/{len(self.expected_tasks)} tasks completed. Waiting for others.",
+                "current_phase": self.phase.value,
+                "new_ideas": []
+            }
+
+        # Evaluate semantic convergence using CrossoverGate
+        crossover_res = self.crossover_gate.evaluate(
+            self.branches[target_branch_id],
+            branch,
+            self.glow_history,
+            self.claim_registry
+        )
+
+        # Transition to IDE_REVIEW to invite grounding
+        self.phase = SwarmPhase.IDE_REVIEW
+        self.round_number += 1
+        review_id = f"review_{self.layer_index.replace('.', '_')}"
+        self.expected_tasks = {review_id}
+        self.completed_tasks = set()
+        self.phase_start_time = time.time()
+
         return {
-            "status": "ACK", 
-            "reason": "Tweet ingested into SYNTHESIS_PENDING phase (Stub)", 
+            "status": "ACK",
+            "reason": (
+                f"Ingested SYNTHESIS branch '{branch_id}'. "
+                f"Convergence evaluate can_merge={crossover_res.get('can_merge')} "
+                f"(Jaccard={crossover_res.get('semantic_convergence')})."
+            ),
+            "current_phase": self.phase.value,
+            "crossover_result": crossover_res
+        }
+
+
+    def _handle_ide_review(self, tweet: Dict) -> Dict:
+        branch_id = tweet.get("branch_id")
+        idea_id = tweet.get("idea_id")
+        if not idea_id:
+            parts = branch_id.split("_")
+            if len(parts) >= 3:
+                idea_id = "_".join(parts[2:])
+
+        if idea_id:
+            self.completed_tasks.add(idea_id)
+
+        self.phase = SwarmPhase.PROMOTED
+        return {
+            "status": "ACK",
+            "reason": "Synthesis successfully reviewed and PROMOTED to final consensus.",
             "current_phase": self.phase.value
         }
 
-    def _handle_ide_review(self, tweet: Dict) -> Dict:
-        return {
-            "status": "ACK", 
-            "reason": "Tweet ingested into IDE_REVIEW phase (Stub)", 
-            "current_phase": self.phase.value
-        }
+

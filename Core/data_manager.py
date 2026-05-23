@@ -24,7 +24,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
-from social_state_machine import SocialStateMachine
+from social_state_machine import SocialStateMachine, SwarmPhase
 from epoch_coordinator import EpochBarrier
 from halting import HaltingController
 
@@ -32,7 +32,6 @@ class DaemonShutdownRequest(Exception):
     pass
 
 # ──────────── CONSTANTS (Frozen at Boot) ────────────
-SOCKET_PATH = "/tmp/swarm-mediator.sock"
 # Resolve workspace root dynamically:
 #   1. JACK_WORKSPACE env var (explicit override)
 #   2. Parent of Core/ directory (the repository root)
@@ -254,9 +253,13 @@ class DataManagerDaemon:
     flows through this single-threaded serializer.
     """
 
-    def __init__(self):
+    def __init__(self, session_id: str = "default", expected_workers: int = 20):
+        self.session_id = session_id
+        self.expected_workers = expected_workers
         self.workspace_root = WORKSPACE_ROOT.resolve()
-        self.socket_path = SOCKET_PATH
+        self.session_dir = self.workspace_root / "sessions" / self.session_id
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.socket_path = f"/tmp/swarm-mediator-{self.session_id}.sock"
         self.server = None
         self.anchor_config = self._load_anchor()
         self.frozen_files = self._parse_frozen_files()
@@ -264,7 +267,7 @@ class DataManagerDaemon:
         self.state = "INIT"
         self.idea_pool: list = []
         
-        self.barrier = EpochBarrier(expected_workers=20, timeout=15.0)
+        self.barrier = EpochBarrier(expected_workers=self.expected_workers, timeout=15.0)
         self.halting_controller = HaltingController()
         self.barrier.start_epoch() # Initialize first clock
 
@@ -388,15 +391,16 @@ class DataManagerDaemon:
             requester = payload.get("requester", "unknown")
             role = payload.get("role", "BUILDER")
             glow = payload.get("glow", 0)
-            current_epoch = payload.get("epoch", 1)
+            current_epoch = payload.get("epoch", 0)
 
-            if self.halting_controller.evaluate_worker(requester, role, current_epoch, glow):
-                self._send_response(conn, "NACK", reason="Worker halted by HaltingController.")
-                return
+            if action not in ("status", "suspend", "wakeup", "shutdown", "load_queue", "pop_idea", "record_residue", "fact_inject", "steer", "worker_exit"):
+                if self.halting_controller.evaluate_worker(requester, role, current_epoch, glow):
+                    self._send_response(conn, "NACK", reason="Worker halted by HaltingController.")
+                    return
 
             self.barrier.checkin(requester)
 
-            if action in ("status", "suspend", "wakeup", "shutdown", "load_queue", "pop_idea", "record_residue", "fact_inject"):
+            if action in ("status", "suspend", "wakeup", "shutdown", "load_queue", "pop_idea", "record_residue", "fact_inject", "steer", "worker_exit"):
                 if action == "status":
                     self._send_response(conn, "ACK", payload=json.dumps({
                         "daemon_state": self.state,
@@ -416,6 +420,8 @@ class DataManagerDaemon:
                     logger.info("Shutdown action received.")
                     self._send_response(conn, "ACK", reason="Shutdown initiated")
                     raise DaemonShutdownRequest()
+                elif action == "worker_exit":
+                    self._send_response(conn, "ACK", reason="Worker exit registered")
                 elif action == "load_queue":
                     pool_file_rel = payload.get("pool_file")
                     if pool_file_rel:
@@ -423,7 +429,7 @@ class DataManagerDaemon:
                         if not pool_file.is_absolute():
                             pool_file = self.workspace_root / pool_file_rel
                     else:
-                        pool_file = self.workspace_root / "tmp" / "idea_pool.json"
+                        pool_file = self.session_dir / "idea_pool.json"
 
                     self._active_pool_file = pool_file
 
@@ -442,7 +448,7 @@ class DataManagerDaemon:
                         idea = self.idea_pool.pop(0)
                         try:
                             active_pool = getattr(self, "_active_pool_file",
-                                                  self.workspace_root / "tmp" / "idea_pool.json")
+                                                  self.session_dir / "idea_pool.json")
                             active_pool.parent.mkdir(parents=True, exist_ok=True)
                             with open(active_pool, "w", encoding="utf-8") as f:
                                 json.dump(self.idea_pool, f, indent=2)
@@ -451,8 +457,35 @@ class DataManagerDaemon:
                         self._send_response(conn, "ACK", payload=json.dumps(idea))
                     else:
                         self._send_response(conn, "EMPTY", reason="No ideas remaining in pool")
+                elif action == "steer":
+                    steer_prompt = payload.get("prompt")
+                    layer_index = payload.get("layer")
+                    if not steer_prompt:
+                        self._send_response(conn, "NACK", reason="Missing 'prompt' for steer action")
+                    else:
+                        if not hasattr(self, "idea_pool") or self.idea_pool is None:
+                            self.idea_pool = []
+                        new_idea = {
+                            "id": f"steer_{int(datetime.now().timestamp())}",
+                            "prompt": steer_prompt,
+                            "description": "Mid-flight steering constraint injected by IDE agent",
+                            "classification": "SWARM"
+                        }
+                        self.idea_pool.append(new_idea)
+                        active_pool = self.session_dir / f"idea_pool_layer_{layer_index}.json" if layer_index else getattr(self, "_active_pool_file", self.session_dir / "idea_pool.json")
+                        try:
+                            active_pool.parent.mkdir(parents=True, exist_ok=True)
+                            with open(active_pool, "w", encoding="utf-8") as f:
+                                json.dump(self.idea_pool, f, indent=2)
+                            logger.info(f"Steering prompt injected: '{steer_prompt}' saved to {active_pool}")
+                            self._send_response(conn, "ACK", reason=f"Steering constraint injected into active pool for layer {layer_index or 'default'}")
+                        except Exception as e:
+                            logger.error(f"Failed to persist steered pool: {e}")
+                            self._send_response(conn, "NACK", reason=f"Failed to persist steered pool: {e}")
+
                 elif action == "record_residue":
                     residue = payload.get("residue")
+                    layer_index = payload.get("layer_index")
                     if residue:
                         residues = []
                         ledger_file_rel = payload.get("ledger_file")
@@ -461,7 +494,7 @@ class DataManagerDaemon:
                             if not residue_file.is_absolute():
                                 residue_file = self.workspace_root / ledger_file_rel
                         else:
-                            residue_file = self.workspace_root / "tmp" / "residue_ledger.json"
+                            residue_file = self.session_dir / f"residue_ledger_layer_{layer_index}.json" if layer_index else self.session_dir / "residue_ledger.json"
 
                         residue_file.parent.mkdir(parents=True, exist_ok=True)
                         if residue_file.exists():
@@ -474,9 +507,10 @@ class DataManagerDaemon:
                         try:
                             with open(residue_file, "w", encoding="utf-8") as f:
                                 json.dump(residues, f, indent=2)
-                            self._send_response(conn, "ACK", reason=f"Residue recorded to {residue_file.name}")
                         except Exception as e:
-                            self._send_response(conn, "NACK", reason=f"Failed to save residue: {e}")
+                            logger.error(f"Failed to save residue: {e}")
+
+                        self._send_response(conn, "ACK", reason=f"Residue recorded to {residue_file.name}")
                     else:
                         self._send_response(conn, "NACK", reason="Missing 'residue' parameter in payload")
                 elif action == "fact_inject":
@@ -520,13 +554,14 @@ class DataManagerDaemon:
                                                  reason=f"No active SocialStateMachine for layer '{layer}'.")
                 return
 
-            if not action or not target_rel and action != "meme":
+            if not action or not target_rel and action not in ("meme", "steer"):
                 self._send_response(conn, "NACK", reason="Missing required fields: 'action' and 'target_file'")
                 return
 
-            if action not in ("read", "write", "meme"):
-                self._send_response(conn, "NACK", reason=f"Unknown action: '{action}'. Allowed: read, write, meme")
+            if action not in ("read", "write", "meme", "steer"):
+                self._send_response(conn, "NACK", reason=f"Unknown action: '{action}'. Allowed: read, write, meme, steer")
                 return
+
 
             if action == "meme":
                 self._handle_meme(conn, payload, requester)
@@ -634,6 +669,22 @@ class DataManagerDaemon:
                 logger.info(f"[{requester}] MEME processed, state persisted to Markdown ledger")
             except Exception as e:
                 logger.error(f"Failed to persist state: {e}")
+
+            # Autonomous adversarial loop: append new ideas generated by state transition
+            new_ideas = response_dict.get("new_ideas", [])
+            if new_ideas:
+                if not hasattr(self, "idea_pool") or self.idea_pool is None:
+                    self.idea_pool = []
+                self.idea_pool.extend(new_ideas)
+                active_pool = getattr(self, "_active_pool_file", self.session_dir / f"idea_pool_layer_{layer_index}.json")
+                try:
+                    active_pool.parent.mkdir(parents=True, exist_ok=True)
+                    with open(active_pool, "w", encoding="utf-8") as f:
+                        json.dump(self.idea_pool, f, indent=2)
+                    logger.info(f"Automatically queued {len(new_ideas)} new ideas to active pool: {active_pool}")
+                except Exception as e:
+                    logger.error(f"Failed to persist dynamically queued ideas: {e}")
+
 
         final_response = {
             "status": response_dict.get("status", "NACK"),
@@ -748,5 +799,12 @@ class PromptAssemblerFactory:
 
 
 if __name__ == "__main__":
-    daemon = DataManagerDaemon()
+    import sys
+    session_id = sys.argv[1] if len(sys.argv) > 1 else "default"
+    try:
+        expected_workers = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+    except ValueError:
+        expected_workers = 20
+        
+    daemon = DataManagerDaemon(session_id=session_id, expected_workers=expected_workers)
     daemon.run()
