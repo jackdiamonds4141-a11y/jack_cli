@@ -42,6 +42,11 @@ try:
 except ImportError:
     trafilatura = None
 
+try:
+    from recon_router import ReconRouter
+except ImportError:
+    ReconRouter = None
+
 
 SESSION_ID = "default"
 SOCKET_PATH = f"/tmp/swarm-mediator-{SESSION_ID}.sock"
@@ -356,7 +361,7 @@ def local_osint_lookup(queries: List[str]) -> str:
     scraped_blocks = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
-    for q in queries[:2]:
+    for q in queries:
         with _CACHE_LOCK:
             conn = sqlite3.connect(_CACHE_DB_PATH)
             c = conn.cursor()
@@ -1428,7 +1433,40 @@ def main():
             "[END SYSTEM DIRECTIVE]\n\n"
         )
         
-        hydrated_prompt = protocol_wrapper + args.prompt
+        # --- LAYER 0 RECON ROUTER INTEGRATION ---
+        research_memo_content = ""
+        if ReconRouter is not None:
+            try:
+                print(f"[*] Booting Epistemic Recon Router for Layer 0 knowledge retrieval...")
+                router = ReconRouter()
+                recon_data = router.query(args.prompt)
+                queries = recon_data.get("queries", [])
+                gates = recon_data.get("gates", [])
+                
+                if queries:
+                    print(f"[*] ReconRouter instantiated {len(queries)} tactical search vectors. Executing OSINT Triangulation Pipeline...")
+                    osint_text = local_osint_lookup(queries)
+                    if osint_text and osint_text != "No local grounding sources retrieved.":
+                        research_memo_content += "=== OSINT GROUNDING INTELLIGENCE ===\n" + osint_text + "\n"
+                        print(f"[+] OSINT Triangulation complete. Grounding intelligence acquired.")
+                
+                if gates:
+                    research_memo_content += "=== ANTI-HALLUCINATION GATES ===\n"
+                    for idx, gate in enumerate(gates, 1):
+                        research_memo_content += f"{idx}. {gate}\n"
+                        
+            except Exception as e:
+                print(f"[-] Epistemic Recon Router failed: {e}. Bypassing Layer 0...")
+        
+        hydrated_prompt = args.prompt
+        
+        if research_memo_content:
+            research_memo = f"\n<research_memo>\n{research_memo_content}</research_memo>\n\n"
+            hydrated_prompt = research_memo + hydrated_prompt
+            print(f"[+] Layer 0 Recon successfully injected into seed prompt.")
+            
+        hydrated_prompt = protocol_wrapper + hydrated_prompt
+        
         if rehydration_context:
             hydrated_prompt = hydrated_prompt + rehydration_context
             print(f"[+] Context Re-Hydration: Injected history from prior layers into seed prompt.")
