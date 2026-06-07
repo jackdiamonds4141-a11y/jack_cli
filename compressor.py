@@ -1,16 +1,24 @@
 import os
 import sys
 import json
-import requests
+import time
+import re
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    print("Error: google-genai library is not installed in the current environment.")
+    sys.exit(1)
 
 COMPRESSION_PROMPT = """You are a Tactical Search Heuristic Extractor.
 Task: Convert the provided raw text chunk into a highly compressed, telegraphic, machine-readable JSON search heuristic.
 
 Strict Rules:
 1. Strip all human grammar, academic hedging, introductory framing, and conversational filler.
-2. Output ONLY a raw JSON object. Do not wrap it in markdown code blocks or any explanatory text.
+2. Output ONLY a raw JSON object matching the schema.
 3. Keep all text in the fields extremely telegraphic (e.g., "Verify EXIF" instead of "It is important to verify the EXIF data").
 4. The output JSON must match exactly this schema:
 {{
@@ -39,50 +47,74 @@ Content:
 {content}
 """
 
+def _load_env_var(var_name: str) -> Optional[str]:
+    """Load environmental variable from OS or local .env file."""
+    if var_name in os.environ:
+        return os.environ[var_name]
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                if key.strip() == var_name:
+                    return val.strip().strip('"').strip("'")
+    return None
+
+
+class APIKeyManager:
+    """Hot-Standby Key Manager specifically for compression task rotation."""
+    def __init__(self):
+        self.keys = []
+        self.clients = {}
+        for env_name in ["GEMINI_API_KEY", "API_KEY_FALLBACK_1", "API_KEY_FALLBACK_2"]:
+            val = _load_env_var(env_name)
+            if val:
+                self.keys.append({
+                    "env_name": env_name,
+                    "key": val,
+                    "is_cooling": False,
+                    "cooldown_until": 0.0
+                })
+                self.clients[val] = genai.Client(api_key=val)
+                
+        if not self.keys:
+            print("[APIKeyManager] CRITICAL: No API keys loaded! Check your .env file.")
+            sys.exit(1)
+            
+    def get_client(self) -> tuple:
+        now = time.time()
+        for i, entry in enumerate(self.keys):
+            if entry["is_cooling"] and now >= entry["cooldown_until"]:
+                entry["is_cooling"] = False
+                
+        for i, entry in enumerate(self.keys):
+            if not entry["is_cooling"]:
+                return self.clients[entry["key"]], i
+                
+        # All cooling - pick the one with shortest remaining wait
+        soonest = min(self.keys, key=lambda e: e["cooldown_until"])
+        wait_time = soonest["cooldown_until"] - now
+        if wait_time > 0:
+            print(f"[APIKeyManager] All keys cooling. Waiting {wait_time:.1f}s for {soonest['env_name']}...")
+            time.sleep(wait_time)
+        soonest["is_cooling"] = False
+        return self.clients[soonest["key"]], self.keys.index(soonest)
+        
+    def report_rate_limited(self, idx: int):
+        entry = self.keys[idx]
+        entry["is_cooling"] = True
+        entry["cooldown_until"] = time.time() + 60.0
+        print(f"[APIKeyManager] Key {entry['env_name']} rate limited. Cooling for 60s.")
+
+
 class TacticalCompressor:
-    def __init__(self, chunks_path: Path, output_path: Path, model_name: str = "gemma2:27b"):
+    def __init__(self, chunks_path: Path, output_path: Path, model_name: str = "gemini-2.5-flash"):
         self.chunks_path = Path(chunks_path)
         self.output_path = Path(output_path)
         self.model_name = model_name
-        self.api_url = "http://localhost:11434/api/generate"
+        self.key_manager = APIKeyManager()
         
-    def _generate_mock_fallback(self, chunk: Dict[str, Any]) -> Dict[str, Any]:
-        """Fallback mock heuristic if Ollama is not running."""
-        content = chunk.get("content", "")
-        domain = chunk.get("domain", "other")
-        
-        # Simple rule extraction based on domain
-        if domain == "law":
-            query_rules = [{
-                "pattern": f"site:gov digital evidence '{domain}'",
-                "engine": "searxng",
-                "example": "site:gov digital evidence electronic crime scene"
-            }]
-            source_targets = ["NIJ manuals", "US Department of Justice"]
-            anti_hallucination_gates = [{"check": "Cross-reference forensics guidelines with standard operating procedures"}]
-        elif domain == "science":
-            query_rules = [{
-                "pattern": f"clinical trial reporting guidelines '{domain}'",
-                "engine": "google",
-                "example": "clinical trial reporting guidelines PRISMA 2020"
-            }]
-            source_targets = ["Cochrane database", "BMJ publications"]
-            anti_hallucination_gates = [{"check": "Verify review criteria matches BMJ standards"}]
-        else:
-            query_rules = [{
-                "pattern": f"OSINT taxonomy tool '{content[:20]}'",
-                "engine": "searxng",
-                "example": f"OSINT taxonomy tool bellingcat"
-            }]
-            source_targets = ["Bellingcat toolkit", "OSINT repositories"]
-            anti_hallucination_gates = [{"check": "Confirm tool status in Bellingcat active directory"}]
-            
-        return {
-            "query_rules": query_rules,
-            "source_targets": source_targets,
-            "anti_hallucination_gates": anti_hallucination_gates
-        }
-
     def compress_chunk(self, chunk: Dict[str, Any]) -> Dict[str, Any]:
         content = chunk.get("content", "")
         # Truncate content to 4000 characters to prevent context overflow
@@ -96,37 +128,46 @@ class TacticalCompressor:
             content=content
         )
         
-        payload = {
-            "model": self.model_name,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.0
-            },
-            "format": "json"
-        }
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.0
+        )
         
-        try:
-            response = requests.post(self.api_url, json=payload, timeout=15)
-            response.raise_for_status()
-            res_json = response.json()
-            response_text = res_json.get("response", "").strip()
-            
-            # Parse the structured JSON response
-            heuristic = json.loads(response_text)
-            
-            # Validate required keys
-            for k in ["query_rules", "source_targets", "anti_hallucination_gates"]:
-                if k not in heuristic:
-                    heuristic[k] = []
+        max_retries = 5
+        for attempt in range(1, max_retries + 1):
+            client, key_idx = self.key_manager.get_client()
+            try:
+                response = client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=config
+                )
+                
+                response_text = response.text.strip() if response.text else ""
+                if not response_text:
+                    raise ValueError("Empty response received from Gemini API.")
+                
+                # Parse JSON output
+                heuristic = json.loads(response_text)
+                
+                # Verify required structure keys
+                for k in ["query_rules", "source_targets", "anti_hallucination_gates"]:
+                    if k not in heuristic:
+                        heuristic[k] = []
+                return heuristic
+                
+            except Exception as e:
+                err_msg = str(e)
+                if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                    self.key_manager.report_rate_limited(key_idx)
+                    continue
+                else:
+                    print(f"Error compressing chunk (Attempt {attempt}/{max_retries}): {e}")
+                    if attempt == max_retries:
+                        raise e
+                    time.sleep(2.0)
                     
-            return heuristic
-            
-        except (requests.exceptions.RequestException, json.JSONDecodeError, ValueError) as e:
-            # If Ollama is not running or the model is not found, print a warning
-            # and fallback to a mock generated heuristic for execution trace validation.
-            print(f"[Warning] LLM API compression failed or Ollama not running: {e}. Using deterministic heuristic fallback.", file=sys.stderr)
-            return self._generate_mock_fallback(chunk)
+        raise RuntimeError("Failed to compress chunk after all retries.")
 
     def process_batches(self, limit: int = None) -> List[Dict[str, Any]]:
         if not self.chunks_path.exists():
@@ -138,11 +179,12 @@ class TacticalCompressor:
             
         if limit:
             chunks = chunks[:limit]
-            print(f"Running compression pipeline on first {limit} chunks...")
+            print(f"Running compression pipeline on first {limit} chunks using Google Gemini API...")
             
         compressed_results = []
         for i, chunk in enumerate(chunks):
-            # Compress chunk content
+            print(f"Compressing chunk {i+1}/{len(chunks)} ({chunk.get('source_id')})...")
+            # Compress chunk content using Gemini API
             compressed_heuristics = self.compress_chunk(chunk)
             
             # Build and append the final object with immutable provenance tags
@@ -155,14 +197,13 @@ class TacticalCompressor:
                 "anti_hallucination_gates": compressed_heuristics.get("anti_hallucination_gates", [])
             }
             compressed_results.append(final_obj)
-            print(f"Processed chunk {i+1}/{len(chunks)} ({chunk.get('source_id')})")
             
         # Ensure output directory exists and write results
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.output_path, "w", encoding="utf-8") as f:
             json.dump(compressed_results, f, indent=2, ensure_ascii=False)
             
-        print(f"\n[TacticalCompressor] Successfully wrote {len(compressed_results)} compressed heuristics to {self.output_path}\n")
+        print(f"\n[TacticalCompressor] Successfully wrote {len(compressed_results)} REAL compressed heuristics to {self.output_path}\n")
         return compressed_results
 
 
@@ -171,11 +212,8 @@ if __name__ == "__main__":
     chunks_json = base_dir / "Reasoning sources" / "ingested" / "chunks.json"
     output_json = base_dir / "wiki" / "raw_compressed_heuristics.json"
     
-    # Check if a different model is specified in env, default to gemma2:27b
-    model = os.getenv("COMPRESSION_MODEL", "gemma2:27b")
-    
     # Instantiates the pipeline
-    compressor = TacticalCompressor(chunks_json, output_json, model_name=model)
+    compressor = TacticalCompressor(chunks_json, output_json, model_name="gemini-2.5-flash")
     
-    # Execute test run on the first 10 chunks
+    # Execute test run on the first 10 chunks to overwrite placeholder data
     compressor.process_batches(limit=10)
