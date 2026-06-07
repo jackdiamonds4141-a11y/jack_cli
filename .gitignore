@@ -11,9 +11,14 @@ tmp/
 *.sock
 *.json
 *.md.tmp
+osint_cache.db
+sessions/
 
 # Protocols (contained within the code, but excluded from Git)
 Protocols/
 
 # Test Outputs
 demo_react_app/
+
+# Reasoning Sources
+Reasoning sources/

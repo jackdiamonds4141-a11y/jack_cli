@@ -62,6 +62,8 @@ except ImportError:
     pass
 
 DAEMON_SCRIPT = Path(__file__).parent / "Core" / "data_manager.py"
+CONTEXT_THRESHOLD = 80000  # Characters — triggers MapReduce splitting for synthesis tasks
+
 def load_env_key() -> Optional[str]:
     # Check OS environment first
     if "GEMINI_API_KEY" in os.environ:
@@ -76,6 +78,110 @@ def load_env_key() -> Optional[str]:
                 if key.strip() == "GEMINI_API_KEY":
                     return val.strip().strip('"').strip("'")
     return None
+
+def _load_env_var(var_name: str) -> Optional[str]:
+    """Load a single environment variable from OS env or .env file."""
+    if var_name in os.environ:
+        return os.environ[var_name]
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                if key.strip() == var_name:
+                    return val.strip().strip('"').strip("'")
+    return None
+
+
+class APIKeyManager:
+    """
+    Hot-Standby API Key Rotation Pool.
+    Tracks per-key cooldown state and provides instant failover
+    when a 429 Rate Limit is encountered, eliminating dead sleep time.
+    """
+    _instance = None
+    COOLDOWN_SECONDS = 60  # How long a key is locked out after a 429
+
+    KEY_ENV_NAMES = ["GEMINI_API_KEY", "API_KEY_FALLBACK_1", "API_KEY_FALLBACK_2"]
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self._lock = threading.Lock()
+        self._keys: List[dict] = []
+        self._clients: dict = {}  # key_string -> genai.Client
+
+        for env_name in self.KEY_ENV_NAMES:
+            key_val = _load_env_var(env_name)
+            if key_val:
+                self._keys.append({
+                    "env_name": env_name,
+                    "key": key_val,
+                    "is_cooling": False,
+                    "cooldown_until": 0.0,
+                })
+                self._clients[key_val] = genai.Client(api_key=key_val)
+                logger.info(f"[APIKeyManager] Loaded key from {env_name}")
+
+        if not self._keys:
+            logger.critical("[APIKeyManager] No API keys found! Check GEMINI_API_KEY, API_KEY_FALLBACK_1, API_KEY_FALLBACK_2.")
+            sys.exit(1)
+
+        logger.info(f"[APIKeyManager] Initialized with {len(self._keys)} key(s) in rotation pool.")
+
+    def get_available_client(self) -> tuple:
+        """
+        Returns (genai.Client, key_index) for the first non-cooling key.
+        If all keys are cooling, waits for the shortest cooldown to expire.
+        """
+        with self._lock:
+            now = time.time()
+            for i, entry in enumerate(self._keys):
+                if entry["is_cooling"] and now >= entry["cooldown_until"]:
+                    entry["is_cooling"] = False
+                    logger.info(f"[APIKeyManager] Key {entry['env_name']} cooldown expired. Re-activated.")
+
+            for i, entry in enumerate(self._keys):
+                if not entry["is_cooling"]:
+                    return self._clients[entry["key"]], i
+
+            # All keys cooling — find the one that expires soonest
+            soonest = min(self._keys, key=lambda e: e["cooldown_until"])
+            wait_time = soonest["cooldown_until"] - now
+
+        if wait_time > 0:
+            logger.warning(f"[APIKeyManager] All keys cooling. Waiting {wait_time:.1f}s for {soonest['env_name']}...")
+            time.sleep(wait_time)
+
+        with self._lock:
+            soonest["is_cooling"] = False
+            return self._clients[soonest["key"]], self._keys.index(soonest)
+
+    def report_rate_limited(self, key_index: int, retry_after: float = None):
+        """
+        Mark a key as rate-limited (cooling down).
+        Uses Retry-After header if available, otherwise defaults to COOLDOWN_SECONDS.
+        """
+        with self._lock:
+            entry = self._keys[key_index]
+            cooldown = retry_after if retry_after else self.COOLDOWN_SECONDS
+            entry["is_cooling"] = True
+            entry["cooldown_until"] = time.time() + cooldown
+            logger.warning(
+                f"[APIKeyManager] Key {entry['env_name']} marked as rate-limited. "
+                f"Cooling for {cooldown:.0f}s. Failing over to next key..."
+            )
+
+    def pool_size(self) -> int:
+        return len(self._keys)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -346,7 +452,47 @@ async def record_failure_residue(idea_id: str, prompt: str, error_msg: str, laye
     except Exception:
         pass
 
-async def worker_task(worker_id: str, layer_index: str, client: genai.Client, semaphore: asyncio.Semaphore):
+async def sub_worker_task(sub_id: str, layer_index: str, prompt_chunk: str, system_instruction: str, key_manager: APIKeyManager) -> Optional[dict]:
+    """
+    Lightweight sub-worker for MapReduce Context Splitting.
+    Processes a partial synthesis chunk using a dynamically acquired API key.
+    """
+    model_name = os.getenv("JACK_WORKER_MODEL", "gemma-4-26b-a4b-it")
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        temperature=0.7,
+    )
+
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        client, key_idx = key_manager.get_available_client()
+        try:
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model_name,
+                    contents=prompt_chunk,
+                    config=config
+                ),
+                timeout=90.0
+            )
+            if not response.text:
+                raise ValueError(f"Sub-worker {sub_id} received empty response.")
+            output = parse_output(response.text.strip(), sub_id)
+            if output and output.get("content"):
+                logger.info(f"[{sub_id}] Partial synthesis complete ({len(output['content'])} chars).")
+                return output
+            raise ValueError(f"Sub-worker {sub_id} parsed output has no content.")
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                key_manager.report_rate_limited(key_idx)
+            if attempt == max_retries:
+                logger.error(f"[{sub_id}] Exhausted {max_retries} sub-worker retries: {e}")
+                return None
+            await asyncio.sleep(2.0)
+    return None
+
+async def worker_task(worker_id: str, layer_index: str, key_manager: APIKeyManager, semaphore: asyncio.Semaphore):
     processed_count = 0
     empty_attempts = 0
     max_empty_attempts = 60  # Wait up to 120 seconds for adversarial steps to populate tasks
@@ -392,13 +538,143 @@ async def worker_task(worker_id: str, layer_index: str, client: genai.Client, se
                 f"<reasoning_trace>\n<Your internal step-by-step reasoning>\n</reasoning_trace>\n"
             )
 
-            # --- Exponential Backoff Retry Loop for Rate-Limited APIs ---
+            # --- Hot-Standby Key Rotation + Exponential Backoff Retry Loop ---
             max_retries = 5
-            base_delay = 15.0   # 15 seconds base (aligns with free-tier ~5 RPM window)
-            max_delay = 120.0   # Cap at 2 minutes
+            base_delay = 5.0    # Reduced from 15s — key rotation handles 429s instantly
+            max_delay = 60.0    # Cap at 1 minute for non-429 errors
             last_error = None
 
+            # ── MapReduce Context Splitting for dense Synthesis tasks ──
+            if "synthesis" in idea_id.lower() and len(idea_prompt) > CONTEXT_THRESHOLD:
+                logger.info(
+                    f"[{worker_id}] CONTEXT SPLIT TRIGGERED for '{idea_id}' "
+                    f"({len(idea_prompt)} chars > {CONTEXT_THRESHOLD} threshold). "
+                    f"Spawning MapReduce sub-workers..."
+                )
+
+                # --- MAP PHASE: Split challenges into two chunks ---
+                # Heuristic: split the prompt at the midpoint of the challenge sections
+                midpoint = len(idea_prompt) // 2
+                # Find a clean split point near the midpoint (avoid cutting mid-sentence)
+                split_idx = idea_prompt.rfind("\n", midpoint - 2000, midpoint + 2000)
+                if split_idx == -1:
+                    split_idx = midpoint
+
+                chunk_a = idea_prompt[:split_idx]
+                chunk_b = idea_prompt[split_idx:]
+
+                sub_instruction = (
+                    f"You are a MapReduce sub-worker for Jack Engine synthesis task '{idea_id}'.\n"
+                    f"You are receiving a PARTIAL set of adversarial challenges and proposals.\n"
+                    f"Synthesize ONLY the arguments presented in this chunk into a coherent partial synthesis.\n"
+                    f"Preserve all key claims, technical details, and architectural decisions.\n\n"
+                    f"You MUST return your output wrapped in XML-style tags. Do not use JSON.\n"
+                    f"<meme_type>SYNTHESIS</meme_type>\n"
+                    f"<content>\nYour partial synthesis of the provided challenges\n</content>\n"
+                    f"<claims>\n  <claim>Key claim 1</claim>\n</claims>\n"
+                )
+
+                sub_a = asyncio.create_task(
+                    sub_worker_task(f"{worker_id}_sub_A", layer_index, chunk_a, sub_instruction, key_manager)
+                )
+                sub_b = asyncio.create_task(
+                    sub_worker_task(f"{worker_id}_sub_B", layer_index, chunk_b, sub_instruction, key_manager)
+                )
+
+                # --- GATHER PHASE ---
+                results = await asyncio.gather(sub_a, sub_b)
+                partial_a, partial_b = results[0], results[1]
+
+                if not partial_a and not partial_b:
+                    logger.error(f"[{worker_id}] Both MapReduce sub-workers failed. Falling back to full-context retry...")
+                    # Fall through to the normal retry loop below
+                else:
+                    # --- REDUCE PHASE: Merge partial syntheses ---
+                    merged_content = ""
+                    merged_claims = []
+                    for partial in [partial_a, partial_b]:
+                        if partial:
+                            merged_content += partial.get("content", "") + "\n\n"
+                            merged_claims.extend(partial.get("claims", []))
+
+                    merge_prompt = (
+                        f"You are the FINAL MERGE worker for synthesis task '{idea_id}'.\n"
+                        f"Below are two partial syntheses from sub-workers who each processed half of the adversarial challenges.\n"
+                        f"Your job is to merge them into ONE cohesive, non-redundant final synthesis.\n"
+                        f"Eliminate duplicates, resolve contradictions, and preserve all unique technical insights.\n\n"
+                        f"--- PARTIAL SYNTHESIS A ---\n{merged_content}\n"
+                        f"--- MERGED CLAIMS SO FAR ---\n{json.dumps(merged_claims[:20])}\n\n"
+                        f"Return the final merged output in XML tags as specified."
+                    )
+
+                    # Acquire whatever key is free RIGHT NOW for the merge
+                    merge_client, merge_key_idx = key_manager.get_available_client()
+                    model_name = os.getenv("JACK_WORKER_MODEL", "gemma-4-26b-a4b-it")
+                    merge_config = types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=0.7,
+                    )
+
+                    try:
+                        merge_response = await asyncio.wait_for(
+                            merge_client.aio.models.generate_content(
+                                model=model_name,
+                                contents=merge_prompt,
+                                config=merge_config
+                            ),
+                            timeout=90.0
+                        )
+                        if merge_response.text:
+                            output = parse_output(merge_response.text.strip(), idea_id, idea)
+                            if output and output.get("content"):
+                                logger.info(f"[{worker_id}] MapReduce MERGE complete for '{idea_id}'.")
+                                # Jump directly to payload submission (skip normal retry loop)
+                                if "meme_type" not in output:
+                                    output["meme_type"] = "SYNTHESIS"
+                                if "claims" not in output or not output["claims"]:
+                                    output["claims"] = merged_claims[:10] if merged_claims else [f"Auto-extracted from {idea_id}"]
+
+                                inferred_target = output.get("target_branch_id")
+                                if not inferred_target or inferred_target in ("null", "None"):
+                                    inferred_target = idea.get("target_branch_id")
+
+                                payload = {
+                                    "action": "meme",
+                                    "meme_type": output.get("meme_type", "SYNTHESIS"),
+                                    "requester": worker_id,
+                                    "layer_index": layer_index,
+                                    "branch_id": f"branch_{worker_id}_{idea_id}",
+                                    "target_branch_id": inferred_target,
+                                    "content": output["content"],
+                                    "claims": output["claims"],
+                                    "idea_id": idea_id
+                                }
+
+                                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                                sock.settimeout(30)
+                                sock.connect(SOCKET_PATH)
+                                sock.sendall(json.dumps(payload).encode("utf-8"))
+                                sock.shutdown(socket.SHUT_WR)
+                                response_data = b""
+                                while True:
+                                    chunk = sock.recv(65536)
+                                    if not chunk:
+                                        break
+                                    response_data += chunk
+                                sock.close()
+                                mediator_response = json.loads(response_data.decode("utf-8"))
+                                logger.info(f"[{worker_id}] MapReduce task '{idea_id}' mediator status: {mediator_response.get('status')}")
+                                processed_count += 1
+                                continue  # Skip to next idea in the while loop
+                    except Exception as e:
+                        error_str = str(e)
+                        if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                            key_manager.report_rate_limited(merge_key_idx)
+                        logger.error(f"[{worker_id}] MapReduce merge failed: {e}. Falling back to normal retry...")
+
             for attempt in range(1, max_retries + 1):
+                # Acquire the best available client from the key rotation pool
+                client, current_key_idx = key_manager.get_available_client()
                 try:
                     # Workers are strictly routed to our small local model (Gemma) to prevent premium namespace exhaustion
                     model_name = os.getenv("JACK_WORKER_MODEL", "gemma-4-26b-a4b-it")
@@ -529,8 +805,10 @@ async def worker_task(worker_id: str, layer_index: str, client: genai.Client, se
                 except Exception as e:
                     last_error = e
                     error_str = str(e)
+                    is_rate_limited = any(code in error_str for code in ["429", "RESOURCE_EXHAUSTED"])
                     is_retryable = (
-                        any(code in error_str for code in ["429", "503", "500", "INTERNAL", "RESOURCE_EXHAUSTED", "UNAVAILABLE"]) or 
+                        is_rate_limited or
+                        any(code in error_str for code in ["503", "500", "INTERNAL", "UNAVAILABLE"]) or 
                         isinstance(e, asyncio.TimeoutError) or 
                         isinstance(e, TimeoutError)
                     )
@@ -541,13 +819,28 @@ async def worker_task(worker_id: str, layer_index: str, client: genai.Client, se
                         send_daemon_message({"action": "shutdown"})
                         os._exit(1)
 
-                    if is_retryable:
-                        # Parse server-suggested retry delay if present
-                        retry_delay = base_delay * (2 ** (attempt - 1))
-                        if retry_delay > max_delay:
-                            retry_delay = max_delay
-                        # Add jitter to prevent thundering herd
+                    if is_rate_limited:
+                        # HOT-STANDBY KEY ROTATION: Mark current key as cooling and retry instantly
+                        # Parse Retry-After header if available
+                        retry_after = None
+                        try:
+                            import re as _re
+                            ra_match = _re.search(r'retry.after[:\s]+(\d+)', error_str, _re.IGNORECASE)
+                            if ra_match:
+                                retry_after = float(ra_match.group(1))
+                        except Exception:
+                            pass
+                        key_manager.report_rate_limited(current_key_idx, retry_after)
+                        logger.info(
+                            f"[{worker_id}] 429 on task '{idea_id}' (attempt {attempt}/{max_retries}). "
+                            f"Instant failover to next key — no sleep."
+                        )
+                        continue  # Retry immediately with the next available key
+
+                    elif is_retryable:
+                        # Non-429 retryable errors (500, 503, timeout) — brief backoff
                         import random
+                        retry_delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
                         jitter = random.uniform(0, base_delay * 0.5)
                         total_delay = retry_delay + jitter
                         logger.warning(
@@ -555,11 +848,6 @@ async def worker_task(worker_id: str, layer_index: str, client: genai.Client, se
                             f"Backing off for {total_delay:.1f}s before retry..."
                         )
                         await asyncio.sleep(total_delay)
-                        
-                        if attempt == 3:
-                            logger.warning(f"[{worker_id}] Region Fallback Initiated: Swapping API endpoint for attempt 4...")
-                            client = genai.Client(api_key=load_env_key(), http_options={'base_url': 'https://generativelanguage.googleapis.com'})
-
                         continue
                     else:
                         # Non-retryable error
@@ -575,12 +863,8 @@ async def worker_task(worker_id: str, layer_index: str, client: genai.Client, se
     }
 
 async def spawn_swarm(layer_index: str, worker_count: int = 20):
-    api_key = load_env_key()
-    if not api_key:
-        logger.critical("GEMINI_API_KEY not found in OS environment or local .env file!")
-        sys.exit(1)
-
-    client = genai.Client(api_key=api_key)
+    key_manager = APIKeyManager()
+    logger.info(f"[Swarm] API Key Pool: {key_manager.pool_size()} key(s) loaded for Hot-Standby rotation.")
 
     semaphore = asyncio.Semaphore(5)
     logger.info(f"Spawning swarm of {worker_count} workers. Concurrency limit: 5.")
@@ -591,7 +875,7 @@ async def spawn_swarm(layer_index: str, worker_count: int = 20):
     tasks = []
     for i in range(1, worker_count + 1):
         worker_id = f"worker_{i:02d}"
-        tasks.append(worker_task(worker_id, layer_index, client, semaphore))
+        tasks.append(worker_task(worker_id, layer_index, key_manager, semaphore))
         if i < worker_count:
             await asyncio.sleep(1.0)  # 1-second stagger between worker launches
 
