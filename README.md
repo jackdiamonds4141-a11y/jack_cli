@@ -43,46 +43,14 @@ This tool is built for the **Gemini AI Studio API**. Any strictly compatible end
 
 ---
 
-## How to Use (The Intended Workflow)
+## How to Use
 
-Jack Engine is a brainstorming and complex reasoning tool. It is designed to be operated **by your IDE agent** (Antigravity, Cursor, Windsurf, etc.), not by hand.
+Jack Engine is a brainstorming and complex reasoning tool designed to be operated **by your IDE agent** (Antigravity, Cursor, Windsurf, etc.), not by hand.
 
-The ideal workflow has **three phases**:
+To get started, simply tell your AI Agent:
+> *"Please read `jack_agent_manual.md` to learn how to use the Jack Engine, and then let's use it to solve our problem."*
 
-### Phase 1: Give your agent the kickoff prompt
-
-Drop this into your IDE agent chat at the start of a new project:
-
-> *"I have a CLI tool at `jack_cli.py` that is set up for brainstorming and complex reasoning. First, run its help command (`python3 jack_cli.py --help`) to read the internal operator manual. Once you fully understand how the tool works — what it does, how layering works, how often to call the swarm, and the critical directives — we will use it to solve our problem. Do not attempt to read or modify the tool's source code. Just execute it as documented."*
-
-The agent will run `--help`, read the full manual baked into the epilog, and from that point on it knows exactly how to invoke the swarm with proper layering, when to call `--cleanup`, and how to consume the consensus dumps.
-
-### Phase 2: The agent creates a plan and highlights brainstorming candidates
-
-After the agent understands the tool, give it your actual task:
-
-> *"Build me a distributed rate-limiter for a multi-region API gateway."*
-
-The agent should then create an **implementation plan** and **identify which sub-tasks need adversarial brainstorming** vs. which ones it can handle natively. For example:
-
-| Sub-task | Needs Brainstorming? |
-|:---|:---|
-| Set up the project directory structure | ❌ No — trivial scaffolding |
-| Design the token bucket algorithm for distributed nodes | ✅ Yes — needs multi-perspective adversarial debate |
-| Write the HTTP middleware integration | ❌ No — standard code generation |
-| Design the consensus protocol for cross-region sync | ✅ Yes — complex architecture decision |
-| Write unit tests | ❌ No — deterministic |
-
-The agent presents this table to **you**, the human, and asks:
-
-> *"I've identified 2 sub-tasks that would benefit from a brainstorming session. Should I send both to the swarm, or would you like to add/remove any from the list?"*
-
-### Phase 3: You confirm, the agent runs the swarm
-
-Once you approve (or modify) the brainstorming list, the agent:
-1. Runs `--cleanup` to clear any stale state.
-2. Fires the swarm for each approved task with the right `--layer` and `--prompt`.
-3. Reads the consensus dump and uses the swarm's output as grounding context for the rest of the implementation.
+The agent will read its manual, break down your task, ask for your approval on which complex sub-tasks should be sent to the swarm, and then execute the CLI on your behalf.
 
 ---
 
@@ -159,34 +127,7 @@ cat sessions/<session-id>/consensus_dump_layer_1.1.json
 | `JACK_WORKER_MODEL` | `gemma-4-26b-a4b-it` | Override the model all workers use. |
 | `JACK_WORKSPACE` | Repo root | Override the workspace root for the mediator daemon. |
 
----
 
-## What's Under the Hood
-
-```
-┌─────────────┐     UDS Socket      ┌──────────────────┐
-│  jack_cli.py │◄───────────────────►│  data_manager.py │
-│  (Conductor) │  /tmp/swarm-        │  (Mediator Daemon)│
-│              │  mediator.sock      │                  │
-│ ┌──────────┐ │                     │ ┌──────────────┐ │
-│ │ Worker 1 │ │                     │ │ Anchor Guard │ │
-│ │ Worker 2 │ │    JSON payloads    │ │ Atomic Write │ │
-│ │ Worker N │ │────────────────────►│ │ Claim Engine │ │
-│ └──────────┘ │                     │ │ Glow Scoring │ │
-└─────────────┘                     │ └──────────────┘ │
-                                    └──────────────────┘
-```
-
-- **Conductor** (`jack_cli.py`) boots the mediator daemon, seeds the task pool, spawns N async workers, and collects results.
-- **Workers** independently call the Gemini API, generating proposals wrapped in robust XML tags to bypass small-model JSON serialization errors, complete with explicit atomic claims.
-- **API Key Rotation Pool** uses hot-standby failover across up to 3 keys. On a 429, the system instantly rotates to the next available key with zero sleep delay.
-- **MapReduce Context Splitting** automatically splits dense synthesis prompts exceeding 80,000 characters into concurrent sub-worker tasks, then merges results using whichever key is free.
-- **OSINT Triangulation Pipeline** features a persistent SQLite-backed SearxNG cache, enabling zero-latency concurrent documentation lookups without API rate-limit bottlenecks.
-- **Mediator Daemon** (`data_manager.py`) serializes everything through a single Unix Domain Socket. Validates payloads, deduplicates claims, computes glow scores, enforces anchor constraints, and persists state via POSIX atomic writes (`tmp → fsync → rename`).
-- **Social State Machine** runs adversarial lifecycle phases: `GENESIS → OPEN_CHALLENGE → SYNTHESIS_PENDING → IDE_REVIEW → PROMOTED`.
-- **Embedded Constitution** — research protocols, source verification frameworks, and agentic coordination rules are baked directly into the worker system instructions. No external config files needed.
-
----
 
 ## Project Structure
 

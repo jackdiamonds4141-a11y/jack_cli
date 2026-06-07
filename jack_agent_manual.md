@@ -95,3 +95,32 @@ If the user specifically requests you to run with `--agent-led-audit`, the CLI w
 *   **Rule 2: Never spam the CLI.** Call it exactly once per sub-task. It spawns 20 parallel async workers internally.
 *   **Rule 3: Always prompt the human.** Never execute `jack_cli.py` without presenting a breakdown plan and receiving explicit `[SWARM]` approval from the human.
 *   **Rule 4: Always read the dump.** Do not guess what the swarm decided. Always `cat` the `consensus_dump_layer_*.json` file.
+
+---
+
+## 5. What's Under the Hood (Architecture Reference)
+
+This section details the system architecture so you understand what happens when you run `jack_cli.py`.
+
+```text
+┌─────────────┐     UDS Socket      ┌──────────────────┐
+│  jack_cli.py │◄───────────────────►│  data_manager.py │
+│  (Conductor) │  /tmp/swarm-        │  (Mediator Daemon)│
+│              │  mediator.sock      │                  │
+│ ┌──────────┐ │                     │ ┌──────────────┐ │
+│ │ Worker 1 │ │                     │ │ Anchor Guard │ │
+│ │ Worker 2 │ │    JSON payloads    │ │ Atomic Write │ │
+│ │ Worker N │ │────────────────────►│ │ Claim Engine │ │
+│ └──────────┘ │                     │ │ Glow Scoring │ │
+└─────────────┘                     │ └──────────────┘ │
+                                    └──────────────────┘
+```
+
+- **Conductor** (`jack_cli.py`) boots the mediator daemon, seeds the task pool, spawns N async workers, and collects results.
+- **Workers** independently call the Gemini API, generating proposals wrapped in robust XML tags to bypass small-model JSON serialization errors, complete with explicit atomic claims.
+- **API Key Rotation Pool** uses hot-standby failover across up to 3 keys. On a 429, the system instantly rotates to the next available key with zero sleep delay.
+- **MapReduce Context Splitting** automatically splits dense synthesis prompts exceeding 80,000 characters into concurrent sub-worker tasks, then merges results using whichever key is free.
+- **OSINT Triangulation Pipeline** features a persistent SQLite-backed SearxNG cache, enabling zero-latency concurrent documentation lookups without API rate-limit bottlenecks.
+- **Mediator Daemon** (`data_manager.py`) serializes everything through a single Unix Domain Socket. Validates payloads, deduplicates claims, computes glow scores, enforces anchor constraints, and persists state via POSIX atomic writes (`tmp → fsync → rename`).
+- **Social State Machine** runs adversarial lifecycle phases: `GENESIS → OPEN_CHALLENGE → SYNTHESIS_PENDING → IDE_REVIEW → PROMOTED`.
+- **Embedded Constitution** — research protocols, source verification frameworks, and agentic coordination rules are baked directly into the worker system instructions. No external config files needed.
