@@ -14,27 +14,39 @@ except ImportError:
     sys.exit(1)
 
 COMPRESSION_PROMPT = """You are a Tactical Search Heuristic Extractor.
-Task: Convert the provided raw text chunk into a highly compressed, telegraphic, machine-readable JSON search heuristic.
+Task: Read the provided raw text chunk from a reference manual and extract the INVESTIGATIVE TECHNIQUES, OSINT METHODOLOGIES, FORENSIC PROCEDURES, and VERIFICATION RULES taught INSIDE the text. Compress them into telegraphic, machine-readable JSON search heuristics.
+
+=== CRITICAL WARNING ===
+DO NOT generate search queries about how to find this manual or document online.
+DO NOT reference the document's title, publisher, authors, ISBN, or URL in query_rules.
+DO NOT create bibliographic citation lookups.
+You MUST extract the actual digital investigation techniques, OSINT search patterns, forensic collection procedures, evidence verification rules, and analytical methodologies that the text is TEACHING the reader to perform.
+If the chunk contains only boilerplate (title pages, tables of contents, copyright notices), return empty arrays.
+=== END CRITICAL WARNING ===
 
 Strict Rules:
 1. Strip all human grammar, academic hedging, introductory framing, and conversational filler.
 2. Output ONLY a raw JSON object matching the schema.
 3. Keep all text in the fields extremely telegraphic (e.g., "Verify EXIF" instead of "It is important to verify the EXIF data").
-4. The output JSON must match exactly this schema:
+4. query_rules must contain OPERATIONAL search patterns an investigator would actually run to gather evidence on a target (e.g., "site:reddit.com/r/{{subreddit}} '{{target_name}}' leak", "{{suspect}} filetype:xls site:{{domain}}").
+5. source_targets must list platforms/databases where an investigator would look for evidence (e.g., "archive.org", "WHOIS registrars", "LinkedIn", "court records").
+6. anti_hallucination_gates must list concrete verification checks from the methodology (e.g., "Cross-reference 3 independent sources", "Verify timestamp against timezone metadata").
+
+The output JSON must match exactly this schema:
 {{
   "query_rules": [
     {{
-      "pattern": "Syntactic query pattern, e.g., site:archive.org '{{query}}'",
+      "pattern": "Operational search pattern with {{template_variables}}",
       "engine": "searxng or google or specific platform",
-      "example": "Concrete example query matching the pattern"
+      "example": "Concrete example of the pattern applied to a real scenario"
     }}
   ],
   "source_targets": [
-    "Target sources/platforms to search, e.g., r/leaks, archive.org"
+    "Platform or database to search for evidence"
   ],
   "anti_hallucination_gates": [
     {{
-      "check": "Specific verification/validation check rule"
+      "check": "Specific verification/validation rule from the methodology"
     }}
   ]
 }}
@@ -182,7 +194,14 @@ class TacticalCompressor:
             print(f"Running compression pipeline on first {limit} chunks using Google Gemini API...")
             
         compressed_results = []
+        skipped = 0
         for i, chunk in enumerate(chunks):
+            # Skip boilerplate chunks (title pages, TOC, copyright notices)
+            content = chunk.get("content", "")
+            if len(content.strip()) < 150:
+                skipped += 1
+                print(f"Skipping chunk {i+1}/{len(chunks)} (too short: {len(content.strip())} chars)")
+                continue
             print(f"Compressing chunk {i+1}/{len(chunks)} ({chunk.get('source_id')})...")
             # Compress chunk content using Gemini API
             compressed_heuristics = self.compress_chunk(chunk)
@@ -203,7 +222,7 @@ class TacticalCompressor:
         with open(self.output_path, "w", encoding="utf-8") as f:
             json.dump(compressed_results, f, indent=2, ensure_ascii=False)
             
-        print(f"\n[TacticalCompressor] Successfully wrote {len(compressed_results)} REAL compressed heuristics to {self.output_path}\n")
+        print(f"\n[TacticalCompressor] Successfully wrote {len(compressed_results)} compressed heuristics to {self.output_path} (skipped {skipped} boilerplate chunks)\n")
         return compressed_results
 
 
