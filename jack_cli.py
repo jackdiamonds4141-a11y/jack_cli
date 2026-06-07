@@ -43,7 +43,7 @@ except ImportError:
     trafilatura = None
 
 try:
-    from recon_router import ReconRouter
+    from Layer0_Recon.recon_router import ReconRouter
 except ImportError:
     ReconRouter = None
 

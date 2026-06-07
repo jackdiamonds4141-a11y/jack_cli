@@ -190,16 +190,21 @@ cat sessions/<session-id>/consensus_dump_layer_1.1.json
 
 ## Project Structure
 
-```
+```text
 jack_cli/
 ├── jack_cli.py                  # CLI conductor — the only file you execute
 ├── jack_agent_manual.md         # Full agent operator manual (for IDE agents)
 ├── requirements.txt             # Python dependencies
-├── recon_router.py              # Layer 0 epistemic query router (O(1) lookup)
-├── compressor.py                # Knowledge chunk compression pipeline
-├── database_builder.py          # Wiki database builder & indexer
-├── knowledge_compiler.py        # Raw document ingestion pipeline
-├── inject_verdict.py            # Agent-led audit verdict injector
+├── Layer0_Recon/                # Epistemic Recon & Knowledge Compiler
+│   ├── recon_router.py          # Layer 0 epistemic query router (O(1) lookup)
+│   ├── compressor.py            # Knowledge chunk compression pipeline
+│   ├── database_builder.py      # Wiki database builder & indexer
+│   ├── knowledge_compiler.py    # Raw document ingestion pipeline
+│   └── wiki/                    # Compiled knowledge database (auto-generated)
+│       ├── index.json           # Master O(1) routing table
+│       └── ...                  # intel/, law/, science/, journalism/
+├── Tools/
+│   └── inject_verdict.py        # Agent-led audit verdict injector
 ├── Core/
 │   ├── data_manager.py          # UDS mediator daemon
 │   ├── social_state_machine.py  # Adversarial lifecycle + claim registry + glow engine
@@ -209,12 +214,6 @@ jack_cli/
 │   ├── attention_variants.py    # Position tagger for prompt assembly
 │   ├── parser.py                # XML-tag output parser
 │   └── act_accumulator.py       # Claim accumulation
-├── wiki/                        # Compiled knowledge database (auto-generated)
-│   ├── index.json               # Master O(1) routing table
-│   ├── intel/                   # Intelligence analysis heuristics
-│   ├── law/                     # Forensic/legal heuristics
-│   ├── science/                 # Scientific review heuristics
-│   └── journalism/              # Verification heuristics
 ├── tests/                       # Unit tests
 ├── .env                         # Your API keys (gitignored, created by --setup)
 └── .gitignore
