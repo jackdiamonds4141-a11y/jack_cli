@@ -172,8 +172,12 @@ class ReconRouter:
         if len(queries) < limit and nouns:
             noun_phrase = " ".join(nouns[:3])
             
+            secondary_noun = nouns[1] if len(nouns) > 1 else ""
             # Generate diverse search vectors from available data
             tactical_templates = [
+                f'{noun_phrase} Wikipedia',
+                f'{nouns[0]} official specifications',
+                f'{nouns[0]} {secondary_noun} history timeline'.strip(),
                 f'"{noun_phrase}" leak OR leaked OR exposed OR internal',
                 f'"{nouns[0]}" filetype:pdf OR filetype:xls confidential',
                 f'site:reddit.com "{nouns[0]}" employee OR former OR insider',

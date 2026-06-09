@@ -47,6 +47,8 @@ try:
 except ImportError:
     ReconRouter = None
 
+SEARXNG_URL = os.environ.get("JACK_SEARXNG_URL", "http://localhost:8080")
+SEARXNG_ALIVE = True
 
 SESSION_ID = "default"
 SOCKET_PATH = f"/tmp/swarm-mediator-{SESSION_ID}.sock"
@@ -356,10 +358,29 @@ def _init_cache_db():
 
 _init_cache_db()
 
+def _searxng_health_check():
+    global SEARXNG_ALIVE
+    test_url = f"{SEARXNG_URL}/?q=test&format=json"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    for attempt in range(3):
+        try:
+            response = requests.get(test_url, timeout=5, headers=headers)
+            if response.status_code == 200:
+                SEARXNG_ALIVE = True
+                return
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(2 ** attempt)
+    
+    print("[!] WARNING: SearxNG is unreachable. Falling back to DuckDuckGo Lite scraper.")
+    SEARXNG_ALIVE = False
+
 def local_osint_lookup(queries: List[str]) -> str:
-    """Query self-hosted local SearxNG search index and extract clean text via Trafilatura."""
+    """Query self-hosted local SearxNG search index (or DuckDuckGo Lite fallback) and extract clean text via Trafilatura."""
     scraped_blocks = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    fetch_tasks = [] # List of tuples: (target_url, query)
     
     for q in queries:
         with _CACHE_LOCK:
@@ -373,36 +394,76 @@ def local_osint_lookup(queries: List[str]) -> str:
             scraped_blocks.append(row[0])
             continue
             
+        target_urls = []
+        if SEARXNG_ALIVE:
+            url = f"{SEARXNG_URL}/?q={q}&format=json"
+            success = False
+            for attempt in range(3):
+                try:
+                    response = requests.get(url, timeout=3, headers=headers)
+                    if response.status_code == 200:
+                        results = response.json().get("results", [])
+                        target_urls = [res.get("url") for res in results[:2] if res.get("url")]
+                        success = True
+                        break
+                    elif response.status_code >= 400 and response.status_code < 500:
+                        break # Permanent error
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                    logger.warning(f"SearxNG connection error (attempt {attempt+1}): {e}")
+                except Exception as e:
+                    logger.error(f"Local OSINT lookup failed for query '{q}': {e}")
+                time.sleep(2 ** attempt)
+            if not success:
+                logger.error(f"SearxNG exhausted retries for query '{q}'")
+        else:
+            # DuckDuckGo Lite fallback
+            ddg_url = f"https://lite.duckduckgo.com/lite/"
+            data = {"q": q}
+            try:
+                response = requests.post(ddg_url, data=data, timeout=4, headers=headers)
+                if response.status_code == 200 and trafilatura:
+                    links = re.findall(r'href="(http[s]?://[^"]+)"', response.text)
+                    target_urls = [l for l in links if "duckduckgo.com" not in l][:2]
+            except Exception as e:
+                logger.error(f"DuckDuckGo fallback failed for query '{q}': {e}")
+
+        for target_url in target_urls:
+            if target_url and trafilatura:
+                fetch_tasks.append((target_url, q))
+                
+    def _fetch_and_extract(url, query):
         try:
-            url = f"http://localhost:8080/?q={q}&format=json"
-            response = requests.get(url, timeout=5, headers=headers)
-            if response.status_code != 200:
-                continue
-            results = response.json().get("results", [])
-            
-            for res in results[:2]:
-                target_url = res.get("url")
-                if not target_url or not trafilatura:
-                    continue
-                downloaded = trafilatura.fetch_url(target_url)
-                if downloaded:
-                    text = trafilatura.extract(downloaded)
-                    if text:
-                        formatted_text = (
-                            f"### Source: {target_url}\n"
-                            f"```text\n{text[:1200]}\n```\n"
-                        )
-                        scraped_blocks.append(formatted_text)
-                        
-                        with _CACHE_LOCK:
-                            conn = sqlite3.connect(_CACHE_DB_PATH)
-                            c = conn.cursor()
-                            c.execute("INSERT OR REPLACE INTO osint_cache (query, result) VALUES (?, ?)", (q, formatted_text))
-                            conn.commit()
-                            conn.close()
+            resp = requests.get(url, timeout=4.0, headers=headers)
+            if resp.status_code == 200:
+                text = trafilatura.extract(resp.text)
+                if text:
+                    formatted = (
+                        f"### Source: {url}\n"
+                        f"```text\n{text[:1200]}\n```\n"
+                    )
+                    with _CACHE_LOCK:
+                        conn = sqlite3.connect(_CACHE_DB_PATH)
+                        c = conn.cursor()
+                        c.execute("INSERT OR REPLACE INTO osint_cache (query, result) VALUES (?, ?)", (query, formatted))
+                        conn.commit()
+                        conn.close()
+                    return formatted
         except Exception as e:
-            logger.error(f"Local OSINT lookup failed for query '{q}': {e}")
-            
+            logger.debug(f"Parallel fetch failed for {url}: {e}")
+        return None
+
+    if fetch_tasks:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(fetch_tasks))) as executor:
+            future_to_url = {executor.submit(_fetch_and_extract, url, q): url for url, q in fetch_tasks}
+            for future in concurrent.futures.as_completed(future_to_url, timeout=6.0):
+                try:
+                    res = future.result(timeout=0.1)
+                    if res:
+                        scraped_blocks.append(res)
+                except Exception:
+                    pass
+
     if not scraped_blocks:
         return "No local grounding sources retrieved."
     return "\n".join(scraped_blocks)
@@ -497,20 +558,22 @@ async def sub_worker_task(sub_id: str, layer_index: str, prompt_chunk: str, syst
             await asyncio.sleep(2.0)
     return None
 
+ACTIVE_TASKS = 0
+
 async def worker_task(worker_id: str, layer_index: str, key_manager: APIKeyManager, semaphore: asyncio.Semaphore):
+    global ACTIVE_TASKS
     processed_count = 0
     empty_attempts = 0
-    max_empty_attempts = 60  # Wait up to 120 seconds for adversarial steps to populate tasks
 
     while True:
         idea = await pop_next_idea()
         if not idea:
-            if empty_attempts < max_empty_attempts:
-                empty_attempts += 1
+            if ACTIVE_TASKS > 0:
+                # Other workers are still processing. Wait patiently.
                 await asyncio.sleep(2.0)
                 continue
             else:
-                logger.info(f"[{worker_id}] Idea pool empty after timeout. Worker exiting.")
+                logger.info(f"[{worker_id}] Idea pool empty and no active tasks. Worker exiting.")
                 try:
                     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     sock.connect(SOCKET_PATH)
@@ -520,6 +583,7 @@ async def worker_task(worker_id: str, layer_index: str, key_manager: APIKeyManag
                     pass
                 break
 
+        ACTIVE_TASKS += 1
         empty_attempts = 0
         idea_id = idea.get("id", "unknown_id")
 
@@ -531,9 +595,10 @@ async def worker_task(worker_id: str, layer_index: str, key_manager: APIKeyManag
             system_instruction = (
                 f"You are Jack Engine worker {worker_id} executing task '{idea_id}' under layer {layer_index}.\n"
                 f"You MUST execute this task under the strict constraints of the Jack Swarm Constitution:\n"
-                f"1. REGIMEGUARD: Prune generic AI fluff, textbook boilerplates, and centralized bottlenecks. "
-                f"Identify and force decentralization, modern production-grade industry optimums, and highly robust architectures.\n"
-                f"2. OSINT VERIFICATION TRIANGLE: Triangulate and verify all technical claims. Since native model tool-calling is disabled on local small infrastructures (like gemma), you MUST simulate your custom web search tools and framework utilities locally within your logical process. Rely strictly on our verified constitutional protocols (`meta_research.md`, `research.md`) to challenge or synthesize claims.\n\n"
+                f"1. REGIMEGUARD: Prune generic AI fluff and textbook boilerplates. "
+                f"Force first-principles reasoning, multi-source triangulation, elimination of single points of failure in logic, and ruthless fact-checking.\n"
+                f"2. OSINT VERIFICATION TRIANGLE: Triangulate and verify all claims. Since native model tool-calling is disabled, you MUST simulate your custom web search tools and framework utilities locally within your logical process. Rely strictly on our verified constitutional protocols (`meta_research.md`, `research.md`) to challenge or synthesize claims.\n"
+                f"3. FORMAT ADHERENCE: If the query is non-technical (e.g., historical, mathematical, factual), you MUST present the raw, verified answer immediately. Do NOT wrap it in ritualistic software frameworks, engineering metaphors, or unnecessary architectures.\n\n"
                 f"You MUST return your output wrapped in the following XML-style tags. Do not use JSON.\n"
                 f"<meme_type>PROPOSAL or CHALLENGE or SYNTHESIS</meme_type>\n"
                 f"<content>\n<Your highly rigorous, detailed proposal, challenge, or synthesis content text>\n</content>\n"
@@ -820,9 +885,10 @@ async def worker_task(worker_id: str, layer_index: str, key_manager: APIKeyManag
 
                     if attempt == max_retries:
                         logger.critical(f"[FATAL CIRCUIT BREAKER] [{worker_id}] Exhausted {max_retries} attempts on task '{idea_id}'. Error: {e}")
-                        logger.critical("Aborting swarm pipeline to prevent context poisoning. Hard halt initiated.")
-                        send_daemon_message({"action": "shutdown"})
-                        os._exit(1)
+                        logger.warning(f"[{worker_id}] Pushing task '{idea_id}' back to pool and dying for respawn...")
+                        send_daemon_message({"action": "push_idea", "idea": idea})
+                        ACTIVE_TASKS -= 1
+                        return {"worker_id": worker_id, "status": "KILLED_RATE_LIMIT", "processed_tasks": processed_count}
 
                     if is_rate_limited:
                         # HOT-STANDBY KEY ROTATION: Mark current key as cooling and retry instantly
@@ -861,6 +927,8 @@ async def worker_task(worker_id: str, layer_index: str, key_manager: APIKeyManag
                         send_daemon_message({"action": "shutdown"})
                         os._exit(1)
 
+        ACTIVE_TASKS -= 1
+
     return {
         "worker_id": worker_id,
         "status": "SUCCESS" if processed_count > 0 else "EMPTY",
@@ -877,17 +945,33 @@ async def spawn_swarm(layer_index: str, worker_count: int = 20):
     # Stagger worker launches to prevent thundering herd on rate-limited APIs.
     # Each worker starts 1 second after the previous one, spreading the initial
     # burst across the RPM window instead of slamming all requests at t=0.
-    tasks = []
+    active_worker_tasks = set()
     for i in range(1, worker_count + 1):
         worker_id = f"worker_{i:02d}"
-        tasks.append(worker_task(worker_id, layer_index, key_manager, semaphore))
-        if i < worker_count:
-            await asyncio.sleep(1.0)  # 1-second stagger between worker launches
+        active_worker_tasks.add(asyncio.create_task(worker_task(worker_id, layer_index, key_manager, semaphore)))
+        await asyncio.sleep(3.0)  # 3-second stagger between worker launches to prevent thundering herd
 
-    results = await asyncio.gather(*tasks)
+    results = []
+    respawn_counter = worker_count + 1
+
+    while active_worker_tasks:
+        done, pending = await asyncio.wait(active_worker_tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            active_worker_tasks.remove(task)
+            try:
+                r = task.result()
+                results.append(r)
+                if r.get("status") == "KILLED_RATE_LIMIT":
+                    # Respawn replacement worker
+                    new_worker_id = f"worker_{respawn_counter:02d}"
+                    respawn_counter += 1
+                    logger.warning(f"[Swarm Manager] Worker {r['worker_id']} was killed. Respawning {new_worker_id} to maintain concurrency...")
+                    active_worker_tasks.add(asyncio.create_task(worker_task(new_worker_id, layer_index, key_manager, semaphore)))
+            except Exception as e:
+                logger.error(f"[Swarm Manager] Worker task crashed unexpectedly: {e}")
 
     total_processed = sum(r.get("processed_tasks", 0) for r in results)
-    logger.info(f"Swarm completion: {worker_count} workers processed a total of {total_processed} tasks.")
+    logger.info(f"Swarm completion: Processing finished with total {total_processed} tasks completed across all generations.")
     return results
 
 
@@ -984,11 +1068,10 @@ def scrape_prior_context(current_layer: str) -> str:
     if not context_fragments:
         print("[*] Re-Hydration: No prior layer context found. Starting fresh.")
         return ""
-
     header = (
-        "\n\n[IMMUTABLE ARCHITECTURAL HISTORICAL CONTEXT — DO NOT CONTRADICT]\n"
+        "\n\n[IMMUTABLE HISTORICAL CONTEXT — DO NOT CONTRADICT]\n"
         "The following is a summary of all previously completed layers.\n"
-        "Your proposals MUST align with and build upon this established architecture.\n\n"
+        "Your proposals MUST align with and build upon this established logical framework and verified data consensus.\n\n"
     )
     return header + "\n".join(context_fragments) + "\n[END OF HISTORICAL CONTEXT]\n"
 
@@ -1343,6 +1426,8 @@ def main():
         help="Inject a mid-flight constraint, fact check, or challenge directly into the active daemon's idea pool for the specified --layer.")
     parser.add_argument("--agent-led-audit", action="store_true",
         help="Enable direct agent-led audit friction after each layer to inject verified facts before advancing.")
+    parser.add_argument("--require-grounding", action="store_true",
+        help="Hard abort if no live OSINT grounding sources are retrieved during the initial recon phase.")
 
 
     args = parser.parse_args()
@@ -1425,10 +1510,11 @@ def main():
         protocol_wrapper = (
             "\n\n[MANDATORY SYSTEM DIRECTIVE — SWARM WORKER RULESET]\n"
             "You MUST execute this task under the strict constraints of the following protocols:\n"
-            "1. REGIMEGUARD: Prune generic AI fluff, textbook boilerplates, and centralized bottlenecks. "
-            "Force decentralization, modern industry optimums, and production-grade architectures.\n"
+            "1. REGIMEGUARD: Prune generic AI fluff and textbook boilerplates. "
+            "Force first-principles reasoning, multi-source triangulation, elimination of single points of failure in logic, and ruthless fact-checking.\n"
             "2. OSINT VERIFICATION TRIANGLE: Triangulate and verify all technical claims across three perspective layers: "
             "first-class official specs, independent real-world benchmarks, and rigorous logical safety proofs.\n"
+            "3. FORMAT ADHERENCE: If the query is non-technical (e.g., historical, mathematical, factual), you MUST present the raw, verified answer immediately. Do NOT wrap it in ritualistic software frameworks, engineering metaphors, or unnecessary architectures.\n"
             "Failure to adhere to these rules will result in immediate worker pruning by the Mediator.\n"
             "[END SYSTEM DIRECTIVE]\n\n"
         )
@@ -1438,25 +1524,44 @@ def main():
         if ReconRouter is not None:
             try:
                 print(f"[*] Booting Epistemic Recon Router for Layer 0 knowledge retrieval...")
+                _searxng_health_check()
                 router = ReconRouter()
                 recon_data = router.query(args.prompt)
                 queries = recon_data.get("queries", [])
                 gates = recon_data.get("gates", [])
                 
+                osint_success = False
                 if queries:
                     print(f"[*] ReconRouter instantiated {len(queries)} tactical search vectors. Executing OSINT Triangulation Pipeline...")
                     osint_text = local_osint_lookup(queries)
                     if osint_text and osint_text != "No local grounding sources retrieved.":
                         research_memo_content += "=== OSINT GROUNDING INTELLIGENCE ===\n" + osint_text + "\n"
-                        print(f"[+] OSINT Triangulation complete. Grounding intelligence acquired.")
+                        osint_success = True
+                        if SEARXNG_ALIVE:
+                            num_sources = len(osint_text.split("### Source: ")) - 1
+                            print(f"[+] OSINT Triangulation complete. {num_sources} grounding sources acquired from SearxNG.")
+                        else:
+                            num_sources = len(osint_text.split("### Source: ")) - 1
+                            print(f"[~] SearxNG offline. Fallback scraper acquired {num_sources} grounding sources.")
+                
+                if not osint_success:
+                    print("[!] WARNING: All OSINT grounding failed. Seed prompt is UNGROUNDED. Swarm outputs may hallucinate factual claims.")
+                    if args.require_grounding:
+                        print("[-] ABORT: --require-grounding flag is active and no OSINT sources were retrieved.")
+                        sys.exit(1)
                 
                 if gates:
                     research_memo_content += "=== ANTI-HALLUCINATION GATES ===\n"
                     for idx, gate in enumerate(gates, 1):
                         research_memo_content += f"{idx}. {gate}\n"
+                    if not osint_success:
+                        print("[~] Only static anti-hallucination gates injected (no live OSINT evidence).")
                         
             except Exception as e:
                 print(f"[-] Epistemic Recon Router failed: {e}. Bypassing Layer 0...")
+                if args.require_grounding:
+                    print("[-] ABORT: --require-grounding flag is active but Epistemic Recon Router failed.")
+                    sys.exit(1)
         
         hydrated_prompt = args.prompt
         
@@ -1496,10 +1601,17 @@ def main():
         write_session_state(daemon_pid=daemon_pid, cli_pid=os.getpid(), status="running", mode="swarm", layer_index=current_layer)
 
         def cleanup_signal(signum, frame):
-            print("\n[*] Interrupted! Suspending persistent daemon...")
-            send_daemon_message({"action": "suspend"})
-            write_session_state(daemon_pid=daemon_pid, status="suspended", mode="swarm", layer_index=current_layer)
-            sys.exit(0)
+            print("\n[*] Interrupted! Killing daemon and exiting...")
+            try:
+                send_daemon_message({"action": "shutdown"})
+            except Exception:
+                pass
+            try:
+                os.kill(daemon_pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+            write_session_state(daemon_pid=daemon_pid, status="interrupted", mode="swarm", layer_index=current_layer)
+            os._exit(0)
 
         signal.signal(signal.SIGINT, cleanup_signal)
         signal.signal(signal.SIGTERM, cleanup_signal)

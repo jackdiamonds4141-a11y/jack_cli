@@ -393,14 +393,14 @@ class DataManagerDaemon:
             glow = payload.get("glow", 0)
             current_epoch = payload.get("epoch", 0)
 
-            if action not in ("status", "suspend", "wakeup", "shutdown", "load_queue", "pop_idea", "record_residue", "fact_inject", "steer", "worker_exit"):
+            if action not in ("status", "suspend", "wakeup", "shutdown", "load_queue", "pop_idea", "push_idea", "record_residue", "fact_inject", "steer", "worker_exit"):
                 if self.halting_controller.evaluate_worker(requester, role, current_epoch, glow):
                     self._send_response(conn, "NACK", reason="Worker halted by HaltingController.")
                     return
 
             self.barrier.checkin(requester)
 
-            if action in ("status", "suspend", "wakeup", "shutdown", "load_queue", "pop_idea", "record_residue", "fact_inject", "steer", "worker_exit"):
+            if action in ("status", "suspend", "wakeup", "shutdown", "load_queue", "pop_idea", "push_idea", "record_residue", "fact_inject", "steer", "worker_exit"):
                 if action == "status":
                     self._send_response(conn, "ACK", payload=json.dumps({
                         "daemon_state": self.state,
@@ -457,6 +457,21 @@ class DataManagerDaemon:
                         self._send_response(conn, "ACK", payload=json.dumps(idea))
                     else:
                         self._send_response(conn, "EMPTY", reason="No ideas remaining in pool")
+                elif action == "push_idea":
+                    idea = payload.get("idea")
+                    if idea:
+                        # Add the task back to the front of the queue
+                        self.idea_pool.insert(0, idea)
+                        try:
+                            active_pool = getattr(self, "_active_pool_file", self.session_dir / "idea_pool.json")
+                            active_pool.parent.mkdir(parents=True, exist_ok=True)
+                            with open(active_pool, "w", encoding="utf-8") as f:
+                                json.dump(self.idea_pool, f, indent=2)
+                        except Exception as e:
+                            logger.error(f"Failed to persist pushed pool: {e}")
+                        self._send_response(conn, "ACK", reason="Idea successfully returned to pool")
+                    else:
+                        self._send_response(conn, "NACK", reason="Missing 'idea' payload")
                 elif action == "steer":
                     steer_prompt = payload.get("prompt")
                     layer_index = payload.get("layer")
