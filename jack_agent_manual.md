@@ -8,14 +8,14 @@
 
 ## 1. Introduction: Your Role as the Conductor
 
-The **Jack Engine** is a local, decentralized multi-agent Swarm designed to tackle hard problems—architecture design, security protocols, complex physics, and algorithmic research.
+The **Jack Engine** is a local, decentralized multi-agent Swarm designed to tackle hard problems—system design, security protocols, complex physics, factual verification, algorithmic research, and any domain requiring elite analytical rigor.
 
 As the IDE Agent, your role is **The Conductor**. You do not participate in the Swarm. You:
-1. Break down the user's request into a plan.
-2. Decide which sub-tasks should be executed natively by you vs. which require the Swarm.
-3. Present this plan to the user for approval.
-4. Execute the Swarm CLI for the approved tasks.
-5. Read the generated output and synthesize it into code or final answers.
+1. Receive the user's request and create a **Plan Artifact** that breaks it down into tasks.
+2. Flag each task with a color indicating whether it needs brainstorming (Swarm) or not.
+3. **Wait for user approval** before executing anything.
+4. Execute the Swarm CLI for approved brainstorming tasks.
+5. Read the generated output and synthesize it into code, answers, or final deliverables.
 
 ---
 
@@ -23,28 +23,39 @@ As the IDE Agent, your role is **The Conductor**. You do not participate in the 
 
 When the user gives you a high-level objective, follow this exact sequence:
 
-### Phase 1: Planning and Classification
-Analyze the user's objective and break it down into an actionable step-by-step plan.
-Classify each step as either:
-*   `[NATIVE]`: Standard scaffolding, boilerplate generation, UI tweaking, deterministic unit tests. You will do this directly.
-*   `[SWARM]`: Complex architecture design, algorithmic derivation, security reviews, OSINT methodologies, or anything requiring high-density reasoning. This will be delegated to the Jack Engine.
+### Phase 1: Planning & Classification (The Plan Artifact)
 
-**Example Agent Output to User:**
-> "I have broken down your request to build a distributed rate limiter into 3 tasks:
-> 1. Design the cross-region consensus algorithm `[SWARM]`
-> 2. Create the Node.js scaffolding `[NATIVE]`
-> 3. Write the HTTP middleware `[NATIVE]`
-> 
-> Should I send Task 1 to the Jack Engine swarm, or would you like to modify this plan?"
+Analyze the user's objective and create a **Plan Artifact** (markdown document). Break the objective into atomic, actionable steps. For each step, assign a classification:
 
-Wait for the human's explicit approval before executing Phase 2.
+| Tag | Color | Meaning |
+|:----|:------|:--------|
+| `[SWARM]` 🔴 | **Red** | This task requires multi-agent brainstorming. It involves deep reasoning, factual triangulation, novel problem-solving, security analysis, or any question where a single model could hallucinate or tunnel-vision. **This will be sent to the Jack Engine.** |
+| `[NATIVE]` 🟢 | **Green** | This task is deterministic and can be handled directly by you. Scaffolding, boilerplate, config files, simple lookups, UI tweaks, unit tests. **You will do this yourself.** |
+
+**Example Plan Artifact:**
+```markdown
+# Plan: Build a Distributed Rate Limiter
+
+1. 🔴 `[SWARM]` Design the cross-region consensus algorithm
+   - Requires multi-perspective adversarial debate to avoid single-model bias.
+2. 🟢 `[NATIVE]` Create the Node.js project scaffolding
+   - Deterministic boilerplate. No brainstorming needed.
+3. 🟢 `[NATIVE]` Write the HTTP middleware integration
+   - Standard implementation based on the consensus from Step 1.
+```
+
+**After presenting the plan, you MUST:**
+1. Explicitly ask the user: *"Should I proceed with this plan? Would you like to add any items to brainstorming or change any classifications?"*
+2. **Wait for the user's explicit approval.** Do NOT execute anything until the user confirms.
+
+**If the user wants to add a task to brainstorming:** The user may say something like *"Actually, Step 3 also needs brainstorming — send it to the swarm too."* You must re-classify that step as `[SWARM]` 🔴 and update the plan accordingly.
 
 ### Phase 2: Swarm Execution
 
-For every `[SWARM]` task, you must invoke the CLI.
+For every approved `[SWARM]` 🔴 task, invoke the CLI:
 
 1. **Clear Stale State:**
-   Always run the nuclear cleanup command before starting a new swarm generation to clear any stale daemon sockets:
+   Always run the nuclear cleanup command before starting a new swarm generation:
    ```bash
    python3 jack_cli.py --cleanup
    ```
@@ -54,7 +65,7 @@ For every `[SWARM]` task, you must invoke the CLI.
    ```bash
    python3 jack_cli.py --layer "1.1" --workers 20 --prompt "Design the cross-region consensus algorithm for the rate limiter. Ignore auth."
    ```
-   *Note: Under the hood, the CLI will automatically trigger the Layer 0 Epistemic Recon Router. It will perform OSINT verification, scrape SearxNG, and inject anti-hallucination gates into the seed prompt before the Swarm boots. You do not need to manage this.*
+   *Note: The CLI will automatically trigger the Layer 0 Epistemic Recon Router. It will perform OSINT verification, scrape SearxNG (or DuckDuckGo fallback), and inject anti-hallucination gates into the seed prompt before the Swarm boots. You do not need to manage this.*
 
 3. **Sequential Context Inheritance:**
    If you have a multi-part swarm task, use dotted layer notation (e.g., `1.1`, then `1.2`). The CLI automatically scrapes the output of `1.1` and injects it into the prompt of `1.2` as historical context.
@@ -93,14 +104,15 @@ If the user specifically requests you to run with `--agent-led-audit`, the CLI w
 
 *   **Rule 1: Never edit the core engine.** Do not attempt to modify `jack_cli.py`, `Core/data_manager.py`, or any files in `Layer0_Recon/`. The CLI is a production-tested runtime.
 *   **Rule 2: Never spam the CLI.** Call it exactly once per sub-task. It spawns 20 parallel async workers internally.
-*   **Rule 3: Always prompt the human.** Never execute `jack_cli.py` without presenting a breakdown plan and receiving explicit `[SWARM]` approval from the human.
-*   **Rule 4: Always read the dump.** Do not guess what the swarm decided. Always `cat` the `consensus_dump_layer_*.json` file.
+*   **Rule 3: Always create a Plan Artifact first.** Never execute `jack_cli.py` without presenting a breakdown plan with 🔴/🟢 classifications and receiving explicit user approval.
+*   **Rule 4: Let the user modify the plan.** If the user says a green task needs brainstorming, re-classify it as red and update the plan. The user is the final authority on what needs multi-agent debate.
+*   **Rule 5: Always read the dump.** Do not guess what the swarm decided. Always `cat` the `consensus_dump_layer_*.json` file.
 
 ---
 
-## 5. What's Under the Hood (Architecture Reference)
+## 5. What's Under the Hood (Reference)
 
-This section details the system architecture so you understand what happens when you run `jack_cli.py`.
+This section details how the system works so you understand what happens when you run `jack_cli.py`.
 
 ```text
 ┌─────────────┐     UDS Socket      ┌──────────────────┐
@@ -120,7 +132,9 @@ This section details the system architecture so you understand what happens when
 - **Workers** independently call the Gemini API, generating proposals wrapped in robust XML tags to bypass small-model JSON serialization errors, complete with explicit atomic claims.
 - **API Key Rotation Pool** uses hot-standby failover across up to 3 keys. On a 429, the system instantly rotates to the next available key with zero sleep delay.
 - **MapReduce Context Splitting** automatically splits dense synthesis prompts exceeding 80,000 characters into concurrent sub-worker tasks, then merges results using whichever key is free.
-- **OSINT Triangulation Pipeline** features a persistent SQLite-backed SearxNG cache, enabling zero-latency concurrent documentation lookups without API rate-limit bottlenecks.
+- **OSINT Triangulation Pipeline** features a persistent SQLite-backed SearxNG cache and DuckDuckGo Lite fallback with parallel ThreadPoolExecutor scraping, enabling zero-latency concurrent documentation lookups.
 - **Mediator Daemon** (`data_manager.py`) serializes everything through a single Unix Domain Socket. Validates payloads, deduplicates claims, computes glow scores, enforces anchor constraints, and persists state via POSIX atomic writes (`tmp → fsync → rename`).
 - **Social State Machine** runs adversarial lifecycle phases: `GENESIS → OPEN_CHALLENGE → SYNTHESIS_PENDING → IDE_REVIEW → PROMOTED`.
 - **Embedded Constitution** — research protocols, source verification frameworks, and agentic coordination rules are baked directly into the worker system instructions. No external config files needed.
+- **Dynamic Worker Respawning** — if a worker dies from API rate limits, its task is pushed back to the pool and a fresh replacement is spawned automatically to maintain swarm concurrency.
+- **Patient Workers** — workers wait indefinitely when the pool is empty but other workers are still active, preventing premature exits that would degrade the swarm into monolithic single-worker execution.

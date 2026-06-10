@@ -178,7 +178,7 @@ class GlowEngine:
 
 class CrossoverGate:
     """
-    FAANG-grade merge triggers.
+    Elite-grade merge triggers.
     All 3 gates must pass simultaneously for a merge to be authorized.
     """
 
@@ -406,9 +406,9 @@ class SocialStateMachine:
             challenge_prompt = (
                 f"CHALLENGE PROMPT: The following claim has been asserted in Layer {self.layer_index}: '{claim_text}'.\n"
                 f"Under the strict constraints of the Swarm Constitution (REGIMEGUARD and OSINT Verification Triangle):\n"
-                f"1. Critically analyze and challenge this claim.\n"
-                f"2. Identify at least 3 concrete failure modes, scalability limits, or architectural vulnerabilities associated with it.\n"
-                f"3. Propose a precise, highly optimized decentralized counter-measure or mitigation.\n\n"
+                f"1. Critically analyze and challenge this claim using first-principles reasoning.\n"
+                f"2. Identify at least 3 concrete failure modes, logical vulnerabilities, or evidential gaps associated with it.\n"
+                f"3. Propose a precise, well-sourced counter-argument or mitigation backed by verifiable data.\n\n"
                 f"Formulate your response as an adversarial CHALLENGE branch targeting parent branch '{branch_id}'."
             )
             new_ideas.append({
@@ -520,10 +520,10 @@ class SocialStateMachine:
             f"SYNTHESIS PROMPT: You are the Synthesis Engine. Your task is to resolve the tension and merge:\n"
             f"1. PROPOSAL Branch '{target_branch_id}':\n{proposal_content}\n\n"
             f"2. CHALLENGES received:\n" + "\n\n".join(challenge_contents) + "\n\n"
-            f"Under the strict constraints of the Swarm Constitution (REGIMEGUARD and OSINT Verification Triangle), you MUST synthesize a reconciled architecture:\n"
-            f"- Directly address and resolve all critical vulnerabilities, edge cases, and failure modes highlighted in the challenges.\n"
-            f"- Retain the core decentralization and structural benefits of the original proposal.\n"
-            f"- Design a highly optimized, fully consistent specification incorporating clear mitigations."
+            f"Under the strict constraints of the Swarm Constitution (REGIMEGUARD and OSINT Verification Triangle), you MUST synthesize a reconciled conclusion:\n"
+            f"- Directly address and resolve all critical vulnerabilities, logical gaps, and failure modes highlighted in the challenges.\n"
+            f"- Retain the core analytical strengths and verified data of the original proposal.\n"
+            f"- Produce a highly rigorous, fully consistent specification incorporating clear mitigations."
         )
 
         synthesis_id = f"synthesis_{self.layer_index.replace('.', '_')}"

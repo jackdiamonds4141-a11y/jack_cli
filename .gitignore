@@ -14,11 +14,15 @@ tmp/
 osint_cache.db
 sessions/
 
-# Protocols (contained within the code, but excluded from Git)
+# Protocols (embedded in jack_cli.py as CONSTITUTION — standalone copies are redundant)
 Protocols/
 
-# Test Outputs
-demo_react_app/
+# Generated Knowledge Database (rebuild locally via knowledge_compiler.py + database_builder.py)
+Layer0_Recon/wiki/
 
-# Reasoning Sources
+# Test / Demo Outputs
+demo_react_app/
+demo/
+
+# Reasoning Sources (3.4GB of PDFs — too large for Git)
 Reasoning sources/

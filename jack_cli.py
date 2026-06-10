@@ -249,7 +249,7 @@ META_RESEARCH = """
 """
 
 RESEARCH = """
-# Unified FAANG-Grade Architecture & Source Verification Protocol
+# Unified FAANG-Grade Elite Analytical & Verification Methodology
 
 ## Step 1: Investigation Preparation and Meta-Reasoning
 * **Objective Specification**: REQUIRE a priori specification of research objectives, methodologies, and analytical parameters before executing any data collection.
@@ -267,26 +267,24 @@ RESEARCH = """
 * **Information Foraging Strategy**: MAXIMIZE the gain of valuable information per unit cost when allocating attention across data patches. TRACK information scent utilizing proximal cues (citations, metadata). IF proximal cues = weak, THEN TERMINATE patch exploration.
 
 ## Step 3: Context-Specific Metric Discovery (The "What to Research" Framework)
-* **First Principles Extraction**: STRIP away assumptions and industry 'best practices'. IDENTIFY the fundamental behavior assumed by the codebase. ASK: "Are we solving a problem the user actually feels, or one they just say they have?"
-* **Inversion Thinking (Failure Analysis)**: BEFORE defining success metrics, DEFINE catastrophic failure. ASK: "What would make this architecture flop completely?" (e.g., alert fatigue, extreme cognitive load, dependency hell).
-* **The Kano Feature Classification**: CLASSIFY all proposed features/architecture components into three psychological buckets:
-  * **Hygiene (Basic Expectations)**: Features that cause dissatisfaction if missing but don't create love (e.g., data privacy, basic error handling). MUST HAVE 100% reliability.
-  * **Performance**: Features where more is better (e.g., execution speed, lower latency).
-  * **Differentiators (Delighters)**: Non-obvious innovations that dramatically improve the workflow.
-* **Impact Mapping**: MAP the system logic using the Actor-Impact-Deliverable path. IDENTIFY whose behavior the code changes and what leading indicators prove the impact.
+* **First Principles Extraction**: STRIP away assumptions and industry 'best practices'. IDENTIFY the fundamental behavior or truth underlying the subject. ASK: "Are we solving a problem the user actually feels, or one they just say they have?"
+* **Inversion Thinking (Failure Analysis)**: BEFORE defining success metrics, DEFINE catastrophic failure. ASK: "What would make this analysis flop completely?" (e.g., circular reporting, confirmation bias, single-source hallucinations).
+* **The Kano Insight Classification**: CLASSIFY all proposed insights, data points, or arguments into three epistemic buckets:
+  * **Hygiene (Basic Verification)**: Data that invalidates the premise if missing but doesn't prove it alone (e.g., primary source dates, basic mathematical sanity checks). MUST HAVE 100% reliability.
+  * **Performance (Corroboration)**: Arguments where more independent sources are better (e.g., cross-referencing multiple verified registries).
+  * **Differentiators (Delighters)**: Non-obvious, deeply hidden insights that dramatically elevate the rigorousness of the conclusion.
+* **Impact Mapping**: MAP the logic using the Evidence-Inference-Conclusion path. IDENTIFY whose bias the data challenges and what leading indicators prove the impact.
 
-## Step 4: FAANG-Grade Product & Engineering Metrics
-* **System Quality & Architecture (Static & Dynamic)**:
-  * **Cyclomatic Complexity & Nesting Depth**: EVALUATE the cognitive load of the logic. Reject deeply nested conditionals.
-  * **Fan-In / Fan-Out**: MEASURE module coupling. High fan-out indicates brittle control logic; high fan-in requires bulletproof testing.
-* **Flow & Developer Experience (DXI)**:
-  * **Cycle Time & Lead Time**: ASSESS how efficiently work moves from idea to delivery.
-  * **Cognitive Load & Feedback Loops**: EVALUATE the repository for friction. Do tests take hours? Is the documentation a wall of text?
-* **User Trust & Psychological Predictability**:
-  * **Time-to-First-Success**: MEASURE how fast a user or developer achieves a successful action post-install.
-  * **Predictable Feedback Loops**: VERIFY that the system provides immediate, consistent confirmation for every action (e.g., clear terminal outputs, error logs that actually explain the fix).
-* **Product Engagement & Health (AARRR Framework)**:
-  * IF evaluating a consumer-facing product repo, ASSESS metrics for Acquisition, Activation, Retention, Referral, and Revenue infrastructure.
+## Step 4: FAANG-Grade Verification & Confidence Metrics
+* **Verification Quality & Data Source (Static & Dynamic)**:
+  * **Source Proximity**: EVALUATE the distance from the primary event. Reject secondary sources when primary registries are available.
+  * **Temporal Accuracy**: MEASURE the timestamp precision. High temporal precision prevents chronological hallucinations.
+* **Signal-to-Noise Filtering**:
+  * **Analytical Friction**: ASSESS how efficiently conclusions can be drawn from raw data.
+  * **Logical Load & Feedback Loops**: EVALUATE the argument for cognitive gaps. Are the logical leaps too large? Is the evidence contradictory?
+* **Confidence & Rigor Predictability**:
+  * **Time-to-First-Verification**: MEASURE how fast a factual assertion achieves independent verification post-claim.
+  * **Predictable Validation Loops**: VERIFY that the analysis provides immediate, consistent confirmation for every logical step (e.g., clear citations, transparent math).
 
 ## Step 5: Signal-to-Noise Filtering & Triangulation
 * **Expert Markers**: VALIDATE the presence of open data, shared analytic code, and adherence to the W3C PROV standard (backward traceability).
@@ -302,7 +300,7 @@ RESEARCH = """
 AGENTIC_PROTOCOL = """
 THE RECURSIVE RIGOR LOOP & CONDUCTOR PROTOCOL
 
-Every step in the provided plan must be treated as a high-stakes engineering module governed by the Conductor Loop. Do not execute a step until its "completeness profile" is defined.
+Every step in the provided plan must be treated as a high-stakes analytical module governed by the Conductor Loop. Do not execute a step until its "completeness profile" is defined.
 
 1. The Conductor Loop (Decomposition & Alignment)
 Before executing a major objective, the IDE Agent (The Conductor) must:
@@ -313,7 +311,7 @@ Before executing a major objective, the IDE Agent (The Conductor) must:
 
 2. SWARM vs. NATIVE Classification Heuristics
     - SWARM Classification:
-        Apply to tasks involving deep logical transformations, novel architectures, complex physical/n-body equations, security or cryptographic protocols, or hard numerical debates where multi-agent adversarial consensus is required to prevent individual model hallucinations.
+        Apply to tasks involving deep logical transformations, novel problem domains, complex physical/n-body equations, security or cryptographic protocols, factual verification requiring multi-source triangulation, or hard analytical debates where multi-agent adversarial consensus is required to prevent individual model hallucinations.
     - NATIVE Classification:
         Apply to tasks involving standard file scaffolding, library configurations, UI layout alignments, static HTML/CSS styling, basic utility helpers, or state-storage persistence integrations that can be written directly by the IDE Agent, bypassing parallel coordination overhead.
 
@@ -321,12 +319,12 @@ Before executing a major objective, the IDE Agent (The Conductor) must:
     - Always pause and seek user feedback whenever:
         * A task is ambiguous, under-specified, or highly open-ended.
         * A proposed task sequence involves complex cross-domain or database dependency serialization.
-        * A critical architectural decision lacks quantitative benchmarks.
+        * A critical decision lacks quantitative benchmarks or verifiable data.
 
 4. Implementation & Sliced Verification
     - Execute exactly one task fragment at a time.
     - If SWARM: Spawn the CLI, capture active process PIDs in 'tmp/jack_session.json', monitor session recovery, and load the final consensus from 'tmp/consensus_dump.json'. Run the OSINT Verification Triangle before implementation.
-    - Context Re-hydration: Prior to a new swarm epoch, manually inject relevant sections of 'project_outline.md' and 'tmp/consensus_dump.json' into the task prompt so that parallel workers have full architectural context and build history.
+    - Context Re-hydration: Prior to a new swarm epoch, manually inject relevant sections of 'project_outline.md' and 'tmp/consensus_dump.json' into the task prompt so that parallel workers have full logical context and verified data history.
     - If NATIVE: Execute code generation natively and perform direct testing.
     - Update progress states ('task.md') and outline notes ('project_outline.md') after each fragment.
 """

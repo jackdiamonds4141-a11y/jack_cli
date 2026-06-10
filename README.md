@@ -50,7 +50,12 @@ Jack Engine is a brainstorming and complex reasoning tool designed to be operate
 To get started, simply tell your AI Agent:
 > *"Please read `jack_agent_manual.md` to learn how to use the Jack Engine, and then let's use it to solve our problem."*
 
-The agent will read its manual, break down your task, ask for your approval on which complex sub-tasks should be sent to the swarm, and then execute the CLI on your behalf.
+The agent will:
+1. Read its manual and understand the Jack Engine workflow.
+2. Break down your task into a **Plan Artifact** with 🔴 `[SWARM]` (needs brainstorming) and 🟢 `[NATIVE]` (agent handles directly) classifications.
+3. Present the plan and **wait for your approval**.
+4. If you think a task needs brainstorming that the agent marked green, just tell it — the agent will re-classify and update the plan.
+5. Execute the CLI for approved swarm tasks, then synthesize the results.
 
 ---
 
@@ -58,7 +63,7 @@ The agent will read its manual, break down your task, ask for your approval on w
 
 Here are real examples of tasks that benefit from the swarm:
 
-### Architecture & System Design
+### System Design & Complex Reasoning
 ```bash
 python3 jack_cli.py --cleanup
 python3 jack_cli.py --layer "1.1" --workers 20 \
@@ -165,7 +170,7 @@ jack_cli/
 ## FAQ
 
 **Q: When should I use this vs. just asking my AI agent directly?**
-A: Use Jack Engine when a single model completion would risk hallucination or tunnel vision. Architecture decisions, security protocol design, novel algorithms, OSINT methodologies, hard physics — anything where you need multiple independent perspectives to converge on a rigorous answer.
+A: Use Jack Engine when a single model completion would risk hallucination or tunnel vision. System design, security protocol design, novel algorithms, OSINT methodologies, hard physics, factual verification requiring multi-source triangulation — anything where you need multiple independent perspectives to converge on a rigorous answer.
 
 **Q: How long does a swarm run take?**
 A: Typically 2–5 minutes for a full 20-worker adversarial swarm on the free Gemini tier. Single-worker research sweeps (`--workers 1`) complete in under 30 seconds.
