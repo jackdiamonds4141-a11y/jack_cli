@@ -103,9 +103,10 @@ def _load_env_var(var_name: str) -> Optional[str]:
 
 class APIKeyManager:
     """
-    Hot-Standby API Key Rotation Pool.
-    Tracks per-key cooldown state and provides instant failover
-    when a 429 Rate Limit is encountered, eliminating dead sleep time.
+    Round-Robin API Key Rotation Pool.
+    Distributes load evenly across all available keys to prevent hitting
+    the tight RPM limits of Gemma 31B/26B on the first few worker requests.
+    Tracks per-key cooldown state and skips cooling keys.
     """
     _instance = None
     COOLDOWN_SECONDS = 60  # How long a key is locked out after a 429
@@ -125,6 +126,7 @@ class APIKeyManager:
         self._lock = threading.Lock()
         self._keys: List[dict] = []
         self._clients: dict = {}  # key_string -> genai.Client
+        self._current_index = 0
 
         for env_name in self.KEY_ENV_NAMES:
             key_val = _load_env_var(env_name)
@@ -142,23 +144,28 @@ class APIKeyManager:
             logger.critical("[APIKeyManager] No API keys found! Check GEMINI_API_KEY, API_KEY_FALLBACK_1, API_KEY_FALLBACK_2.")
             sys.exit(1)
 
-        logger.info(f"[APIKeyManager] Initialized with {len(self._keys)} key(s) in rotation pool.")
+        logger.info(f"[APIKeyManager] Initialized with {len(self._keys)} key(s) in Round-Robin pool.")
 
     def get_available_client(self) -> tuple:
         """
-        Returns (genai.Client, key_index) for the first non-cooling key.
+        Returns (genai.Client, key_index) using a Round-Robin strategy.
         If all keys are cooling, waits for the shortest cooldown to expire.
         """
         with self._lock:
             now = time.time()
-            for i, entry in enumerate(self._keys):
+            for entry in self._keys:
                 if entry["is_cooling"] and now >= entry["cooldown_until"]:
                     entry["is_cooling"] = False
                     logger.info(f"[APIKeyManager] Key {entry['env_name']} cooldown expired. Re-activated.")
 
-            for i, entry in enumerate(self._keys):
+            # Scan starting from the current index, looping around if necessary
+            start_index = self._current_index
+            for i in range(len(self._keys)):
+                idx = (start_index + i) % len(self._keys)
+                entry = self._keys[idx]
                 if not entry["is_cooling"]:
-                    return self._clients[entry["key"]], i
+                    self._current_index = (idx + 1) % len(self._keys)
+                    return self._clients[entry["key"]], idx
 
             # All keys cooling — find the one that expires soonest
             soonest = min(self._keys, key=lambda e: e["cooldown_until"])
@@ -170,7 +177,9 @@ class APIKeyManager:
 
         with self._lock:
             soonest["is_cooling"] = False
-            return self._clients[soonest["key"]], self._keys.index(soonest)
+            idx = self._keys.index(soonest)
+            self._current_index = (idx + 1) % len(self._keys)
+            return self._clients[soonest["key"]], idx
 
     def report_rate_limited(self, key_index: int, retry_after: float = None):
         """
@@ -184,7 +193,7 @@ class APIKeyManager:
             entry["cooldown_until"] = time.time() + cooldown
             logger.warning(
                 f"[APIKeyManager] Key {entry['env_name']} marked as rate-limited. "
-                f"Cooling for {cooldown:.0f}s. Failing over to next key..."
+                f"Cooling for {cooldown:.0f}s. Rotating to next key..."
             )
 
     def pool_size(self) -> int:
@@ -521,7 +530,7 @@ async def sub_worker_task(sub_id: str, layer_index: str, prompt_chunk: str, syst
     Lightweight sub-worker for MapReduce Context Splitting.
     Processes a partial synthesis chunk using a dynamically acquired API key.
     """
-    model_name = os.getenv("JACK_WORKER_MODEL", "gemma-4-26b-a4b-it")
+    model_name = os.getenv("JACK_WORKER_MODEL", "gemma-4-31b-it")
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         temperature=0.7,
@@ -677,7 +686,7 @@ async def worker_task(worker_id: str, layer_index: str, key_manager: APIKeyManag
 
                     # Acquire whatever key is free RIGHT NOW for the merge
                     merge_client, merge_key_idx = key_manager.get_available_client()
-                    model_name = os.getenv("JACK_WORKER_MODEL", "gemma-4-26b-a4b-it")
+                    model_name = os.getenv("JACK_WORKER_MODEL", "gemma-4-31b-it")
                     merge_config = types.GenerateContentConfig(
                         system_instruction=system_instruction,
                         temperature=0.7,
@@ -745,7 +754,7 @@ async def worker_task(worker_id: str, layer_index: str, key_manager: APIKeyManag
                 client, current_key_idx = key_manager.get_available_client()
                 try:
                     # Workers are strictly routed to our small local model (Gemma) to prevent premium namespace exhaustion
-                    model_name = os.getenv("JACK_WORKER_MODEL", "gemma-4-26b-a4b-it")
+                    model_name = os.getenv("JACK_WORKER_MODEL", "gemma-4-31b-it")
                     is_gemma = "gemma" in model_name.lower()
 
                     # JSON schemas removed - using XML Tag Extraction instead
